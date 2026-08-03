@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from pydantic import BaseModel, ValidationError
+
+
+# 规定工具执行函数的形式：
+# 接收一个经过 Pydantic 校验的参数对象，返回任意类型结果。
+ToolHandler = Callable[[BaseModel], Any]
+
+
+@dataclass(frozen=True)
+class RegisteredTool:
+    """保存一个工具的完整定义。"""
+
+    name: str
+    description: str
+    args_model: type[BaseModel]
+    handler: ToolHandler
+
+    def to_openai_schema(self) -> dict[str, Any]:
+        """将工具转换为大模型 Function Calling 所需的格式。"""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.args_model.model_json_schema(),
+            },
+        }
+
+
+class ToolExecutionResult(BaseModel):
+    """统一表示一次工具执行的结果。"""
+
+    ok: bool
+    tool_name: str
+    data: Any | None = None
+    error: str | None = None
+
+
+class ToolRegistry:
+    """负责工具的注册、查询、描述和执行。"""
+
+    def __init__(self) -> None:
+        self._tools: dict[str, RegisteredTool] = {}
+
+    def register(
+        self,
+        *,
+        name: str,
+        description: str,
+        args_model: type[BaseModel],
+        handler: ToolHandler,
+    ) -> None:
+        """向注册中心添加一个工具。"""
+        if name in self._tools:
+            raise ValueError(f"工具已经存在：{name}")
+
+        self._tools[name] = RegisteredTool(
+            name=name,
+            description=description,
+            args_model=args_model,
+            handler=handler,
+        )
+
+    def get(self, name: str) -> RegisteredTool:
+        """根据名称获取工具。"""
+        try:
+            return self._tools[name]
+        except KeyError as exc:
+            raise KeyError(f"未找到工具：{name}") from exc
+
+    def list_names(self) -> list[str]:
+        """返回当前已经注册的全部工具名称。"""
+        return list(self._tools.keys())
+
+    def to_openai_tools(self) -> list[dict[str, Any]]:
+        """生成可以直接传给大模型的工具列表。"""
+        return [
+            tool.to_openai_schema()
+            for tool in self._tools.values()
+        ]
+
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult:
+        """校验参数并执行指定工具。"""
+        try:
+            tool = self.get(name)
+        except KeyError as exc:
+            return ToolExecutionResult(
+                ok=False,
+                tool_name=name,
+                error=str(exc),
+            )
+
+        try:
+            validated_args = tool.args_model.model_validate(arguments)
+            result = tool.handler(validated_args)
+
+        except ValidationError as exc:
+            return ToolExecutionResult(
+                ok=False,
+                tool_name=name,
+                error=f"工具参数校验失败：{exc}",
+            )
+
+        except Exception as exc:
+            return ToolExecutionResult(
+                ok=False,
+                tool_name=name,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        return ToolExecutionResult(
+            ok=True,
+            tool_name=name,
+            data=result,
+        )
