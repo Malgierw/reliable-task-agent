@@ -295,3 +295,79 @@ def test_agent_records_invalid_tool_arguments() -> None:
     )
 
     assert second_request_messages[-1]["role"] == "tool"
+
+def test_agent_records_tool_validation_failure() -> None:
+    """JSON 合法但参数值错误时，应记录工具校验失败。"""
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_invalid_bandwidth",
+                        function=FakeFunction(
+                            name="calculate_shannon_capacity",
+                            arguments=(
+                                '{"bandwidth_hz": -1, '
+                                '"snr_db": 10}'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(
+                content="带宽必须大于零，请提供有效参数。",
+            ),
+        ]
+    )
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=fake_client,
+        model="fake-model",
+    )
+
+    answer = agent.run("计算带宽为 -1 Hz 时的信道容量。")
+
+    assert answer == "带宽必须大于零，请提供有效参数。"
+
+    assert agent.last_trace is not None
+
+    event_types = [
+        event.event_type
+        for event in agent.last_trace.events
+    ]
+
+    assert event_types == [
+        "model_response",
+        "tool_call",
+        "tool_result",
+        "model_response",
+        "final_answer",
+    ]
+
+    tool_call = agent.last_trace.events[1]
+    tool_result = agent.last_trace.events[2]
+
+    # JSON 本身可以正常解析，所以 Trace 中记录的是 arguments，
+    # 而不是 raw_arguments。
+    assert tool_call.details["arguments"] == {
+        "bandwidth_hz": -1,
+        "snr_db": 10,
+    }
+
+    # Registry 的 Pydantic 校验应拒绝负数带宽。
+    assert tool_result.details["ok"] is False
+    assert tool_result.details["data"] is None
+    assert "工具参数校验失败" in tool_result.details["error"]
+    assert "greater than 0" in tool_result.details["error"]
+
+    # 错误结果仍应返回给模型进行第二轮回答。
+    assert len(fake_client.completions.requests) == 2
+
+    second_request_messages = (
+        fake_client.completions.requests[1]["messages"]
+    )
+
+    assert second_request_messages[-1]["role"] == "tool"
