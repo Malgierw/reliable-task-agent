@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import httpx
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -20,13 +21,21 @@ def create_client() -> tuple[OpenAI, str]:
     if not model:
         raise RuntimeError("缺少 LLM_MODEL，请检查项目根目录中的 .env 文件。")
 
+    http_client = httpx.Client(
+        trust_env=False,
+        timeout=httpx.Timeout(
+            timeout=60.0,
+            connect=20.0,
+        ),
+    )
+
     client = OpenAI(
         api_key=api_key,
         base_url=base_url or None,
         timeout=60.0,
         max_retries=2,
+        http_client=http_client,
     )
-
     return client, model
 
 
