@@ -219,3 +219,79 @@ def test_agent_returns_answer_without_tool_call() -> None:
     ]
 
     assert len(fake_client.completions.requests) == 1
+
+def test_agent_records_invalid_tool_arguments() -> None:
+    """工具参数不是合法 JSON 时，应记录失败并继续运行。"""
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_invalid_json",
+                        function=FakeFunction(
+                            name="calculate_shannon_capacity",
+                            # 故意缺少最后的右花括号
+                            arguments=(
+                                '{"bandwidth_hz": 20000000, '
+                                '"snr_db": 10'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(
+                content="工具参数格式错误，无法完成计算。",
+            ),
+        ]
+    )
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=fake_client,
+        model="fake-model",
+    )
+
+    answer = agent.run(
+        "计算带宽为 20 MHz、SNR 为 10 dB 时的容量。"
+    )
+
+    assert answer == "工具参数格式错误，无法完成计算。"
+
+    assert agent.last_trace is not None
+
+    event_types = [
+        event.event_type
+        for event in agent.last_trace.events
+    ]
+
+    assert event_types == [
+        "model_response",
+        "tool_call",
+        "tool_result",
+        "model_response",
+        "final_answer",
+    ]
+
+    tool_call = agent.last_trace.events[1]
+    tool_result = agent.last_trace.events[2]
+
+    assert tool_call.details["tool_name"] == (
+        "calculate_shannon_capacity"
+    )
+    assert "raw_arguments" in tool_call.details
+
+    assert tool_result.details["ok"] is False
+    assert tool_result.details["data"] is None
+    assert "工具参数解析失败" in tool_result.details["error"]
+
+    # 即使参数错误，Agent 仍会把错误结果返回模型，
+    # 让模型进行第二轮回答。
+    assert len(fake_client.completions.requests) == 2
+
+    second_request_messages = (
+        fake_client.completions.requests[1]["messages"]
+    )
+
+    assert second_request_messages[-1]["role"] == "tool"
