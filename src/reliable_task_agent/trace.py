@@ -11,6 +11,7 @@ TraceEventType = Literal[
     "model_response",
     "tool_call",
     "tool_result",
+    "retry",
     "final_answer",
     "error",
 ]

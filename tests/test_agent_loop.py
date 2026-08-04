@@ -109,6 +109,50 @@ class FakeClient:
             completions=self.completions,
         )
 
+class RetryableModelError(RuntimeError):
+    """模拟服务器暂时不可用。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.status_code = 503
+
+
+class FlakyCompletions:
+    """第一次请求失败，第二次请求成功。"""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+        self.call_count = 0
+
+    def create(self, **kwargs: Any) -> Any:
+        self.requests.append(deepcopy(kwargs))
+        self.call_count += 1
+
+        if self.call_count == 1:
+            raise RetryableModelError(
+                "模拟服务器暂时不可用"
+            )
+
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=FakeMessage(
+                        content="重试后请求成功。",
+                    )
+                )
+            ]
+        )
+
+
+class FlakyClient:
+    """模拟一次失败后恢复的模型客户端。"""
+
+    def __init__(self) -> None:
+        self.completions = FlakyCompletions()
+        self.chat = SimpleNamespace(
+            completions=self.completions,
+        )
+
 class FailingCompletions:
     """模拟模型请求发生异常。"""
 
@@ -412,3 +456,46 @@ def test_agent_records_model_request_error() -> None:
     assert error_event.details["stage"] == "model_request"
     assert error_event.details["error_type"] == "RuntimeError"
     assert error_event.details["message"] == "模拟网络错误"
+    
+def test_agent_retries_transient_model_error() -> None:
+    """临时性模型错误应自动重试并记录 Trace。"""
+
+    fake_client = FlakyClient()
+    sleep_delays: list[float] = []
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=fake_client,
+        model="fake-model",
+        max_model_retries=2,
+        retry_delay_seconds=0.5,
+        sleep_fn=sleep_delays.append,
+    )
+
+    answer = agent.run("执行一个任务。")
+
+    assert answer == "重试后请求成功。"
+    assert fake_client.completions.call_count == 2
+
+    # 测试中不会真的等待，只记录本应等待多久。
+    assert sleep_delays == [0.5]
+
+    assert agent.last_trace is not None
+
+    event_types = [
+        event.event_type
+        for event in agent.last_trace.events
+    ]
+
+    assert event_types == [
+        "retry",
+        "model_response",
+        "final_answer",
+    ]
+
+    retry_event = agent.last_trace.events[0]
+
+    assert retry_event.details["attempt"] == 1
+    assert retry_event.details["next_attempt"] == 2
+    assert retry_event.details["delay_seconds"] == 0.5
+    assert retry_event.details["status_code"] == 503

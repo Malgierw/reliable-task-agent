@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import time
+from collections.abc import Callable
+
 from openai import OpenAI
 
 from reliable_task_agent.model_client import create_client
@@ -21,6 +24,33 @@ SYSTEM_PROMPT = """
 3. 最终回答应说明使用了哪些工具，并基于工具结果作答。
 """.strip()
 
+RETRYABLE_STATUS_CODES = {
+    408,  # Request Timeout
+    409,  # Conflict
+    429,  # Too Many Requests
+    500,
+    502,
+    503,
+    504,
+}
+
+RETRYABLE_ERROR_NAMES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "RateLimitError",
+    "InternalServerError",
+}
+
+
+def is_retryable_model_error(exc: Exception) -> bool:
+    """判断模型请求异常是否可能通过重试恢复。"""
+
+    status_code = getattr(exc, "status_code", None)
+
+    if status_code in RETRYABLE_STATUS_CODES:
+        return True
+
+    return type(exc).__name__ in RETRYABLE_ERROR_NAMES
 
 class AgentLoop:
     """负责模型与工具之间的循环调用。"""
@@ -32,6 +62,9 @@ class AgentLoop:
         client: OpenAI | None = None,
         model: str | None = None,
         max_steps: int = 5,
+        max_model_retries: int = 2,
+        retry_delay_seconds: float = 1.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         if client is None and model is None:
             client, model = create_client()
@@ -43,12 +76,95 @@ class AgentLoop:
         if max_steps < 1:
             raise ValueError("max_steps 必须大于等于 1。")
 
+        if max_model_retries < 0:
+            raise ValueError(
+                "max_model_retries 必须大于等于 0。"
+            )
+
+        if retry_delay_seconds < 0:
+            raise ValueError(
+                "retry_delay_seconds 必须大于等于 0。"
+            )
+            
         self.registry = registry
         self.client = client
         self.model = model
         self.max_steps = max_steps
+        self.max_model_retries = max_model_retries
+        self.retry_delay_seconds = retry_delay_seconds
+        self.sleep_fn = sleep_fn
         self.last_trace: RunTrace | None = None
+        
+    def _request_model(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        step: int,
+        trace: RunTrace,
+    ) -> Any:
+        """请求模型，并对临时性错误进行指数退避重试。"""
 
+        total_attempts = self.max_model_retries + 1
+
+        for attempt in range(1, total_attempts + 1):
+            try:
+                return self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=self.registry.to_openai_tools(),
+                    tool_choice="auto",
+                )
+
+            except Exception as exc:
+                retryable = is_retryable_model_error(exc)
+                is_last_attempt = attempt == total_attempts
+
+                if not retryable or is_last_attempt:
+                    trace.add(
+                        step=step,
+                        event_type="error",
+                        details={
+                            "stage": "model_request",
+                            "attempt": attempt,
+                            "max_attempts": total_attempts,
+                            "retryable": retryable,
+                            "error_type": type(exc).__name__,
+                            "status_code": getattr(
+                                exc,
+                                "status_code",
+                                None,
+                            ),
+                            "message": str(exc),
+                        },
+                    )
+                    raise
+
+                delay = self.retry_delay_seconds * (
+                    2 ** (attempt - 1)
+                )
+
+                trace.add(
+                    step=step,
+                    event_type="retry",
+                    details={
+                        "stage": "model_request",
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "delay_seconds": delay,
+                        "error_type": type(exc).__name__,
+                        "status_code": getattr(
+                            exc,
+                            "status_code",
+                            None,
+                        ),
+                        "message": str(exc),
+                    },
+                )
+
+                self.sleep_fn(delay)
+
+        raise RuntimeError("模型请求重试流程异常结束。")
+    
     def run(self, user_input: str) -> str:
         """执行一次完整的用户任务。"""
 
@@ -70,24 +186,12 @@ class AgentLoop:
         ]
 
         for step in range(1, self.max_steps + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=self.registry.to_openai_tools(),
-                    tool_choice="auto",
-                )
-            except Exception as exc:
-                trace.add(
-                    step=step,
-                    event_type="error",
-                    details={
-                        "stage": "model_request",
-                        "error_type": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                )
-                raise
+            response = self._request_model(
+            messages=messages,
+            step=step,
+            trace=trace,
+)
+
 
             assistant_message = response.choices[0].message
 
