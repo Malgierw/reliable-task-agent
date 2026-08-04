@@ -109,7 +109,21 @@ class FakeClient:
             completions=self.completions,
         )
 
+class FailingCompletions:
+    """模拟模型请求发生异常。"""
 
+    def create(self, **_: Any) -> Any:
+        raise RuntimeError("模拟网络错误")
+
+
+class FailingClient:
+    """提供与 OpenAI 客户端相同的属性结构。"""
+
+    def __init__(self) -> None:
+        self.chat = SimpleNamespace(
+            completions=FailingCompletions(),
+        )
+        
 def test_agent_calls_tool_and_records_trace() -> None:
     """Agent 应调用工具，并记录完整执行轨迹。"""
 
@@ -371,3 +385,30 @@ def test_agent_records_tool_validation_failure() -> None:
     )
 
     assert second_request_messages[-1]["role"] == "tool"
+
+def test_agent_records_model_request_error() -> None:
+    """模型请求失败时，应记录错误 Trace 并继续抛出异常。"""
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=FailingClient(),
+        model="fake-model",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="模拟网络错误",
+    ):
+        agent.run("执行一个任务。")
+
+    assert agent.last_trace is not None
+
+    assert len(agent.last_trace.events) == 1
+
+    error_event = agent.last_trace.events[0]
+
+    assert error_event.event_type == "error"
+    assert error_event.step == 1
+    assert error_event.details["stage"] == "model_request"
+    assert error_event.details["error_type"] == "RuntimeError"
+    assert error_event.details["message"] == "模拟网络错误"
