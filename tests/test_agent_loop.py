@@ -9,7 +9,7 @@ import pytest
 
 from reliable_task_agent.agent_loop import AgentLoop
 from reliable_task_agent.tools.builtin import build_default_registry
-
+from reliable_task_agent.trace_store import TraceStore
 
 @dataclass
 class FakeFunction:
@@ -499,3 +499,74 @@ def test_agent_retries_transient_model_error() -> None:
     assert retry_event.details["next_attempt"] == 2
     assert retry_event.details["delay_seconds"] == 0.5
     assert retry_event.details["status_code"] == 503
+
+def test_agent_persists_completed_trace(tmp_path) -> None:
+    """完成任务后，Agent 应将 Trace 自动保存到磁盘。"""
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="任务执行完成。",
+            )
+        ]
+    )
+
+    store = TraceStore(tmp_path / "runs")
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=fake_client,
+        model="fake-model",
+        trace_store=store,
+    )
+
+    answer = agent.run("执行一个简单任务。")
+
+    assert answer == "任务执行完成。"
+    assert agent.last_trace is not None
+
+    run_id = agent.last_trace.run_id
+
+    assert store.list_run_ids() == [run_id]
+
+    loaded_trace = store.load(run_id)
+
+    assert loaded_trace == agent.last_trace
+    assert [
+        event.event_type
+        for event in loaded_trace.events
+    ] == [
+        "model_response",
+        "final_answer",
+    ]
+
+def test_agent_persists_error_trace(tmp_path) -> None:
+    """模型请求失败时，错误 Trace 也应保存到磁盘。"""
+
+    store = TraceStore(tmp_path / "runs")
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=FailingClient(),
+        model="fake-model",
+        trace_store=store,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="模拟网络错误",
+    ):
+        agent.run("执行一个任务。")
+
+    assert agent.last_trace is not None
+
+    run_id = agent.last_trace.run_id
+    loaded_trace = store.load(run_id)
+
+    assert len(loaded_trace.events) == 1
+
+    error_event = loaded_trace.events[0]
+
+    assert error_event.event_type == "error"
+    assert error_event.details["stage"] == "model_request"
+    assert error_event.details["message"] == "模拟网络错误"

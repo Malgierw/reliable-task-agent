@@ -10,7 +10,9 @@ from openai import OpenAI
 
 from reliable_task_agent.model_client import create_client
 from reliable_task_agent.tools.registry import ToolRegistry
-from reliable_task_agent.trace import RunTrace
+# from reliable_task_agent.trace import RunTrace
+from reliable_task_agent.trace import RunTrace, TraceEventType
+from reliable_task_agent.trace_store import TraceStore
 
 SYSTEM_PROMPT = """
 你是一个可靠的工程任务智能体。
@@ -65,6 +67,7 @@ class AgentLoop:
         max_model_retries: int = 2,
         retry_delay_seconds: float = 1.0,
         sleep_fn: Callable[[float], None] = time.sleep,
+        trace_store: TraceStore | None = None,
     ) -> None:
         if client is None and model is None:
             client, model = create_client()
@@ -94,7 +97,33 @@ class AgentLoop:
         self.retry_delay_seconds = retry_delay_seconds
         self.sleep_fn = sleep_fn
         self.last_trace: RunTrace | None = None
-        
+        self.trace_store = trace_store
+
+    def _persist_trace(self, trace: RunTrace) -> None:
+        """在配置了 TraceStore 时保存当前执行轨迹。"""
+
+        if self.trace_store is not None:
+            self.trace_store.save(trace)
+
+
+    def _record_event(
+        self,
+        *,
+        trace: RunTrace,
+        step: int,
+        event_type: TraceEventType,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """记录一个 Trace 事件并立即保存。"""
+
+        trace.add(
+            step=step,
+            event_type=event_type,
+            details=details,
+        )
+
+        self._persist_trace(trace)
+    
     def _request_model(
         self,
         *,
@@ -120,7 +149,8 @@ class AgentLoop:
                 is_last_attempt = attempt == total_attempts
 
                 if not retryable or is_last_attempt:
-                    trace.add(
+                    self._record_event(
+                        trace=trace,
                         step=step,
                         event_type="error",
                         details={
@@ -143,7 +173,8 @@ class AgentLoop:
                     2 ** (attempt - 1)
                 )
 
-                trace.add(
+                self._record_event(
+                    trace=trace,
                     step=step,
                     event_type="retry",
                     details={
@@ -173,6 +204,7 @@ class AgentLoop:
 
         trace = RunTrace()
         self.last_trace = trace
+        self._persist_trace(trace)
 
         messages: list[dict[str, Any]] = [
             {
@@ -201,7 +233,8 @@ class AgentLoop:
             )
             message_data.pop("reasoning_content", None)
 
-            trace.add(
+            self._record_event(
+                trace=trace,
                 step=step,
                 event_type="model_response",
                 details={
@@ -215,7 +248,8 @@ class AgentLoop:
             # 没有请求调用工具，说明模型已经给出最终答案
             if not assistant_message.tool_calls:
                 if not assistant_message.content:
-                    trace.add(
+                    self._record_event(
+                        trace=trace,
                         step=step,
                         event_type="error",
                         details={
@@ -230,7 +264,8 @@ class AgentLoop:
                         "模型没有返回文本内容，也没有调用工具。"
                     )
 
-                trace.add(
+                self._record_event(
+                    trace=trace,
                     step=step,
                     event_type="final_answer",
                     details={
@@ -253,7 +288,8 @@ class AgentLoop:
                             "工具参数必须是 JSON 对象。"
                         )
 
-                    trace.add(
+                    self._record_event(
+                        trace=trace,
                         step=step,
                         event_type="tool_call",
                         details={
@@ -272,7 +308,8 @@ class AgentLoop:
                         mode="json"
                     )
 
-                    trace.add(
+                    self._record_event(
+                        trace=trace,
                         step=step,
                         event_type="tool_result",
                         details={
@@ -294,7 +331,8 @@ class AgentLoop:
                         "error": f"工具参数解析失败：{exc}",
                     }
 
-                    trace.add(
+                    self._record_event(
+                        trace=trace,
                         step=step,
                         event_type="tool_call",
                         details={
@@ -304,7 +342,8 @@ class AgentLoop:
                         },
                     )
 
-                    trace.add(
+                    self._record_event(
+                        trace=trace,
                         step=step,
                         event_type="tool_result",
                         details={
@@ -331,7 +370,8 @@ class AgentLoop:
             f"Agent 在 {self.max_steps} 轮内未完成任务。"
         )
 
-        trace.add(
+        self._record_event(
+            trace=trace,
             step=self.max_steps,
             event_type="error",
             details={
