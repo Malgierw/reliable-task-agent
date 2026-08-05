@@ -10,6 +10,7 @@ import pytest
 from reliable_task_agent.agent_loop import AgentLoop
 from reliable_task_agent.tools.builtin import build_default_registry
 from reliable_task_agent.trace_store import TraceStore
+from reliable_task_agent.checkpoint_store import CheckpointStore
 
 @dataclass
 class FakeFunction:
@@ -570,3 +571,109 @@ def test_agent_persists_error_trace(tmp_path) -> None:
     assert error_event.event_type == "error"
     assert error_event.details["stage"] == "model_request"
     assert error_event.details["message"] == "模拟网络错误"
+
+def test_agent_persists_completed_checkpoint(
+    tmp_path,
+) -> None:
+    """完成任务后，应保存 completed Checkpoint。"""
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="任务执行完成。",
+            )
+        ]
+    )
+
+    store = CheckpointStore(tmp_path / "runs")
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=fake_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    answer = agent.run("执行一个简单任务。")
+
+    assert answer == "任务执行完成。"
+    assert agent.last_checkpoint is not None
+
+    checkpoint = store.load(
+        agent.last_checkpoint.run_id
+    )
+
+    assert checkpoint.status == "completed"
+    assert checkpoint.final_answer == "任务执行完成。"
+    assert checkpoint.error_message is None
+
+    assert checkpoint.messages[-1]["role"] == (
+        "assistant"
+    )
+    assert checkpoint.messages[-1]["content"] == (
+        "任务执行完成。"
+    )
+    
+def test_agent_records_completed_tool_in_checkpoint(
+    tmp_path,
+) -> None:
+    """成功执行的工具应记录进 Checkpoint。"""
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_checkpoint_001",
+                        function=FakeFunction(
+                            name="calculate_shannon_capacity",
+                            arguments=(
+                                '{"bandwidth_hz": 20000000, '
+                                '"snr_db": 10}'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(
+                content="容量约为 69.19 Mbps。",
+            ),
+        ]
+    )
+
+    store = CheckpointStore(tmp_path / "runs")
+
+    agent = AgentLoop(
+        build_default_registry(),
+        client=fake_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    agent.run("计算信道容量。")
+
+    assert agent.last_checkpoint is not None
+
+    checkpoint = store.load(
+        agent.last_checkpoint.run_id
+    )
+
+    saved_call = checkpoint.completed_tool_calls[
+        "call_checkpoint_001"
+    ]
+
+    assert saved_call.tool_name == (
+        "calculate_shannon_capacity"
+    )
+    assert saved_call.arguments == {
+        "bandwidth_hz": 20_000_000,
+        "snr_db": 10,
+    }
+    assert saved_call.result["ok"] is True
+    assert saved_call.result["data"][
+        "capacity_mbps"
+    ] == pytest.approx(
+        69.1886,
+        rel=1e-4,
+    )

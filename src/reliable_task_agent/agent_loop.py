@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
-from typing import Any
+
 
 import time
+import json
+from typing import Any
+from copy import deepcopy
 from collections.abc import Callable
 
 from openai import OpenAI
@@ -13,6 +15,11 @@ from reliable_task_agent.tools.registry import ToolRegistry
 # from reliable_task_agent.trace import RunTrace
 from reliable_task_agent.trace import RunTrace, TraceEventType
 from reliable_task_agent.trace_store import TraceStore
+from reliable_task_agent.checkpoint import (
+    AgentCheckpoint,
+    CompletedToolCall,
+)
+from reliable_task_agent.checkpoint_store import CheckpointStore
 
 SYSTEM_PROMPT = """
 你是一个可靠的工程任务智能体。
@@ -68,6 +75,7 @@ class AgentLoop:
         retry_delay_seconds: float = 1.0,
         sleep_fn: Callable[[float], None] = time.sleep,
         trace_store: TraceStore | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         if client is None and model is None:
             client, model = create_client()
@@ -98,6 +106,8 @@ class AgentLoop:
         self.sleep_fn = sleep_fn
         self.last_trace: RunTrace | None = None
         self.trace_store = trace_store
+        self.checkpoint_store = checkpoint_store
+        self.last_checkpoint: AgentCheckpoint | None = None
 
     def _persist_trace(self, trace: RunTrace) -> None:
         """在配置了 TraceStore 时保存当前执行轨迹。"""
@@ -105,6 +115,33 @@ class AgentLoop:
         if self.trace_store is not None:
             self.trace_store.save(trace)
 
+    def _persist_checkpoint(
+        self,
+        checkpoint: AgentCheckpoint,
+    ) -> None:
+        """配置了 CheckpointStore 时，保存当前任务状态。"""
+
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.save(checkpoint)
+
+
+    def _sync_checkpoint_messages(
+        self,
+        *,
+        checkpoint: AgentCheckpoint,
+        messages: list[dict[str, Any]],
+        next_step: int | None = None,
+    ) -> None:
+        """同步消息上下文、下一轮位置，并保存 Checkpoint。"""
+
+        checkpoint.messages = deepcopy(messages)
+
+        if next_step is None:
+            checkpoint.touch()
+        else:
+            checkpoint.advance_to(next_step)
+
+        self._persist_checkpoint(checkpoint)
 
     def _record_event(
         self,
@@ -130,6 +167,7 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         step: int,
         trace: RunTrace,
+        checkpoint: AgentCheckpoint,
     ) -> Any:
         """请求模型，并对临时性错误进行指数退避重试。"""
 
@@ -167,6 +205,10 @@ class AgentLoop:
                             "message": str(exc),
                         },
                     )
+                    
+                    checkpoint.mark_failed(str(exc))
+                    self._persist_checkpoint(checkpoint)
+                    
                     raise
 
                 delay = self.retry_delay_seconds * (
@@ -216,12 +258,22 @@ class AgentLoop:
                 "content": user_input,
             },
         ]
+        
+        checkpoint = AgentCheckpoint(
+            run_id=trace.run_id,
+            next_step=1,
+            messages=deepcopy(messages),
+        )
+
+        self.last_checkpoint = checkpoint
+        self._persist_checkpoint(checkpoint)
 
         for step in range(1, self.max_steps + 1):
             response = self._request_model(
             messages=messages,
             step=step,
             trace=trace,
+            checkpoint=checkpoint,
 )
 
 
@@ -244,7 +296,13 @@ class AgentLoop:
 
             # 保存模型本轮回复，包括可能存在的 tool_calls
             messages.append(message_data)
-
+            
+            self._sync_checkpoint_messages(
+                checkpoint=checkpoint,
+                messages=messages,
+                next_step=step,
+            )
+            
             # 没有请求调用工具，说明模型已经给出最终答案
             if not assistant_message.tool_calls:
                 if not assistant_message.content:
@@ -272,6 +330,11 @@ class AgentLoop:
                         "content": assistant_message.content,
                     },
                 )
+
+                checkpoint.mark_completed(
+                    assistant_message.content
+                )
+                self._persist_checkpoint(checkpoint)
 
                 return assistant_message.content
 
@@ -307,6 +370,18 @@ class AgentLoop:
                     result_data = result.model_dump(
                         mode="json"
                     )
+
+                    if result.ok:
+                        checkpoint.record_tool_call(
+                            CompletedToolCall(
+                                tool_call_id=tool_call.id,
+                                tool_name=tool_name,
+                                arguments=arguments,
+                                result=result_data,
+                            )
+                        )
+
+                        self._persist_checkpoint(checkpoint)
 
                     self._record_event(
                         trace=trace,
@@ -365,11 +440,23 @@ class AgentLoop:
                         "content": tool_content,
                     }
                 )
-
+                
+                self._sync_checkpoint_messages(
+                    checkpoint=checkpoint,
+                    messages=messages,
+                    next_step=step,
+                )
+            
+            checkpoint.advance_to(step + 1)
+            self._persist_checkpoint(checkpoint)
+        
         error_message = (
             f"Agent 在 {self.max_steps} 轮内未完成任务。"
         )
-
+        
+        checkpoint.mark_failed(error_message)
+        self._persist_checkpoint(checkpoint)
+        
         self._record_event(
             trace=trace,
             step=self.max_steps,
