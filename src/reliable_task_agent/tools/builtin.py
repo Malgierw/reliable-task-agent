@@ -28,7 +28,10 @@ def calculate_shannon_capacity(
     """根据带宽和信噪比计算香农理论容量。"""
 
     snr_linear = 10 ** (args.snr_db / 10)
-    capacity_bps = args.bandwidth_hz * math.log2(1 + snr_linear)
+    capacity_bps = (
+        args.bandwidth_hz
+        * math.log2(1 + snr_linear)
+    )
 
     return {
         "bandwidth_hz": args.bandwidth_hz,
@@ -63,11 +66,14 @@ def read_text_file(
     """安全读取工作区内的文本文件。"""
 
     workspace = workspace.resolve()
-    file_path = (workspace / args.path).resolve()
+    file_path = (
+        workspace / args.path
+    ).resolve()
 
-    # 防止通过 ../ 或绝对路径访问工作区之外的文件
     try:
-        relative_path = file_path.relative_to(workspace)
+        relative_path = file_path.relative_to(
+            workspace
+        )
     except ValueError as exc:
         raise PermissionError(
             "禁止读取工作区之外的文件。"
@@ -83,13 +89,96 @@ def read_text_file(
             f"目标不是文件：{relative_path}"
         )
 
-    content = file_path.read_text(encoding="utf-8")
-    truncated = len(content) > args.max_chars
+    content = file_path.read_text(
+        encoding="utf-8"
+    )
+
+    truncated = (
+        len(content) > args.max_chars
+    )
 
     return {
         "path": relative_path.as_posix(),
         "content": content[: args.max_chars],
         "total_chars": len(content),
+        "truncated": truncated,
+    }
+
+
+class ListWorkspaceFilesArgs(BaseModel):
+    """列出 workspace 中的文件。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = "."
+    recursive: bool = True
+    max_files: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+    )
+
+
+def list_workspace_files(
+    args: ListWorkspaceFilesArgs,
+    workspace: Path,
+) -> dict[str, object]:
+    """安全列出 workspace 中指定目录下的文件。"""
+
+    workspace = workspace.resolve()
+
+    target = (
+        workspace / args.path
+    ).resolve()
+
+    try:
+        target.relative_to(workspace)
+    except ValueError as exc:
+        raise ValueError(
+            "不允许访问 workspace 之外的路径。"
+        ) from exc
+
+    if not target.exists():
+        raise FileNotFoundError(
+            f"路径不存在：{args.path}"
+        )
+
+    if not target.is_dir():
+        raise ValueError(
+            f"目标不是目录：{args.path}"
+        )
+
+    if args.recursive:
+        candidates = target.rglob("*")
+    else:
+        candidates = target.iterdir()
+
+    files: list[str] = []
+    truncated = False
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+
+        if len(files) >= args.max_files:
+            truncated = True
+            break
+
+        relative_path = path.relative_to(
+            workspace
+        )
+
+        files.append(
+            relative_path.as_posix()
+        )
+
+    files.sort()
+
+    return {
+        "path": args.path,
+        "recursive": args.recursive,
+        "files": files,
+        "count": len(files),
         "truncated": truncated,
     }
 
@@ -115,7 +204,10 @@ def build_default_registry(
     def handle_read_text_file(
         args: ReadTextFileArgs,
     ) -> dict[str, object]:
-        return read_text_file(args, workspace_path)
+        return read_text_file(
+            args,
+            workspace_path,
+        )
 
     registry.register(
         name="read_text_file",
@@ -125,6 +217,25 @@ def build_default_registry(
         ),
         args_model=ReadTextFileArgs,
         handler=handle_read_text_file,
+    )
+
+    def handle_list_workspace_files(
+        args: ListWorkspaceFilesArgs,
+    ) -> dict[str, object]:
+        return list_workspace_files(
+            args,
+            workspace_path,
+        )
+
+    registry.register(
+        name="list_workspace_files",
+        description=(
+            "列出工作区中的文件。"
+            "可以指定相对目录、是否递归以及最大文件数。"
+            "不能访问 workspace 之外的路径。"
+        ),
+        args_model=ListWorkspaceFilesArgs,
+        handler=handle_list_workspace_files,
     )
 
     return registry

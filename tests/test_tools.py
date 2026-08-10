@@ -95,3 +95,148 @@ def test_read_text_file_rejects_outside_path(tmp_path) -> None:
     assert result.data is None
     assert result.error is not None
     assert "禁止读取工作区之外" in result.error
+    
+def test_list_workspace_files_success(
+    tmp_path,
+) -> None:
+    """应递归列出 workspace 内的文件。"""
+
+    (tmp_path / "config.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+
+    (
+        notes_dir / "experiment.md"
+    ).write_text(
+        "实验说明",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "list_workspace_files",
+        {
+            "path": ".",
+            "recursive": True,
+        },
+    )
+
+    assert result.ok is True
+    assert result.data is not None
+
+    assert result.data["count"] == 2
+
+    assert result.data["files"] == [
+        "config.json",
+        "notes/experiment.md",
+    ]
+
+    assert result.data["truncated"] is False
+
+def test_list_workspace_files_non_recursive(
+    tmp_path,
+) -> None:
+    """recursive=False 时，不应进入子目录。"""
+
+    (tmp_path / "root.txt").write_text(
+        "root",
+        encoding="utf-8",
+    )
+
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+
+    (
+        nested_dir / "inside.txt"
+    ).write_text(
+        "inside",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "list_workspace_files",
+        {
+            "path": ".",
+            "recursive": False,
+        },
+    )
+
+    assert result.ok is True
+
+    assert result.data["files"] == [
+        "root.txt",
+    ]
+
+def test_list_workspace_files_rejects_outside_path(
+    tmp_path,
+) -> None:
+    """不得通过 .. 逃出 workspace。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    registry = build_default_registry(
+        workspace
+    )
+
+    result = registry.execute(
+        "list_workspace_files",
+        {
+            "path": "../outside",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert result.error is not None
+
+    assert (
+        "workspace 之外"
+        in result.error
+    )
+
+def test_list_workspace_files_respects_max_files(
+    tmp_path,
+) -> None:
+    """文件数量超过 max_files 时应截断结果。"""
+
+    for index in range(5):
+        (
+            tmp_path / f"file_{index}.txt"
+        ).write_text(
+            str(index),
+            encoding="utf-8",
+        )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "list_workspace_files",
+        {
+            "path": ".",
+            "recursive": True,
+            "max_files": 3,
+        },
+    )
+
+    assert result.ok is True
+
+    assert result.data["count"] == 3
+    assert len(result.data["files"]) == 3
+    assert result.data["truncated"] is True
