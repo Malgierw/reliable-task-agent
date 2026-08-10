@@ -303,10 +303,10 @@ class AgentLoop:
 
         for step in range(start_step, self.max_steps + 1):
             response = self._request_model(
-            messages=messages,
-            step=step,
-            trace=trace,
-            checkpoint=checkpoint,
+                messages=messages,
+                step=step,
+                trace=trace,
+                checkpoint=checkpoint,
 )
 
 
@@ -538,107 +538,4 @@ class AgentLoop:
             checkpoint=checkpoint,
             start_step=start_step,
         )
-
-    def test_agent_resumes_failed_checkpoint(
-        tmp_path,
-    ) -> None:
-        """失败任务应能从保存的轮次和消息继续执行。"""
-
-        run_id = "c" * 32
-
-        checkpoint = AgentCheckpoint(
-            run_id=run_id,
-            next_step=2,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "系统提示词",
-                },
-                {
-                    "role": "user",
-                    "content": "继续执行任务。",
-                },
-            ],
-        )
-
-        checkpoint.mark_failed("模拟上一次请求失败")
-
-        store = CheckpointStore(tmp_path / "runs")
-        store.save(checkpoint)
-
-        fake_client = FakeClient(
-            messages=[
-                FakeMessage(
-                    content="恢复后的任务已经完成。",
-                )
-            ]
-        )
-
-        agent = AgentLoop(
-            build_default_registry(),
-            client=fake_client,
-            model="fake-model",
-            checkpoint_store=store,
-        )
-
-        answer = agent.resume(run_id)
-
-        assert answer == "恢复后的任务已经完成。"
-
-        loaded_checkpoint = store.load(run_id)
-
-        assert loaded_checkpoint.status == "completed"
-        assert loaded_checkpoint.final_answer == (
-            "恢复后的任务已经完成。"
-        )
-        assert loaded_checkpoint.error_message is None
-
-        assert len(fake_client.completions.requests) == 1
-
-    def test_agent_resume_returns_completed_answer(
-        tmp_path,
-    ) -> None:
-        """已完成任务不应再次调用模型。"""
-
-        run_id = "d" * 32
-
-        checkpoint = AgentCheckpoint(
-            run_id=run_id,
-        )
-        checkpoint.mark_completed("之前保存的最终答案。")
-
-        store = CheckpointStore(tmp_path / "runs")
-        store.save(checkpoint)
-
-        fake_client = FakeClient(messages=[])
-
-        agent = AgentLoop(
-            build_default_registry(),
-            client=fake_client,
-            model="fake-model",
-            checkpoint_store=store,
-        )
-
-        answer = agent.resume(run_id)
-
-        assert answer == "之前保存的最终答案。"
-        assert len(fake_client.completions.requests) == 0
-
-    def test_agent_resume_requires_checkpoint_store() -> None:
-        """未配置 CheckpointStore 时不能恢复任务。"""
-
-        fake_client = FakeClient(messages=[])
-
-        agent = AgentLoop(
-            build_default_registry(),
-            client=fake_client,
-            model="fake-model",
-        )
-
-        with pytest.raises(
-            RuntimeError,
-            match="CheckpointStore",
-        ):
-            agent.resume("e" * 32)
-
 
