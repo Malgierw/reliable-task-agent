@@ -240,3 +240,141 @@ def test_list_workspace_files_respects_max_files(
     assert result.data["count"] == 3
     assert len(result.data["files"]) == 3
     assert result.data["truncated"] is True
+
+def test_search_text_success(
+    tmp_path,
+) -> None:
+    """应返回匹配文本所在文件、行号和内容。"""
+
+    (tmp_path / "config.txt").write_text(
+        "mode=test\nthreshold=0.85\n",
+        encoding="utf-8",
+    )
+
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+
+    (
+        notes_dir / "experiment.md"
+    ).write_text(
+        "Experiment notes\n"
+        "Threshold should remain stable.\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "search_text",
+        {
+            "query": "threshold",
+        },
+    )
+
+    assert result.ok is True
+    assert result.data is not None
+    assert result.data["match_count"] == 2
+
+    assert result.data["matches"] == [
+        {
+            "path": "config.txt",
+            "line_number": 2,
+            "line": "threshold=0.85",
+        },
+        {
+            "path": "notes/experiment.md",
+            "line_number": 2,
+            "line": (
+                "Threshold should remain stable."
+            ),
+        },
+    ]
+
+def test_search_text_case_sensitive(
+    tmp_path,
+) -> None:
+    """case_sensitive=True 时应区分大小写。"""
+
+    (tmp_path / "notes.txt").write_text(
+        "Threshold=0.8\n"
+        "threshold=0.9\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "search_text",
+        {
+            "query": "threshold",
+            "case_sensitive": True,
+        },
+    )
+
+    assert result.ok is True
+    assert result.data["match_count"] == 1
+    assert result.data["matches"][0][
+        "line"
+    ] == "threshold=0.9"
+    
+def test_search_text_rejects_outside_path(
+    tmp_path,
+) -> None:
+    """搜索不得逃出 workspace。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    registry = build_default_registry(
+        workspace
+    )
+
+    result = registry.execute(
+        "search_text",
+        {
+            "query": "secret",
+            "path": "../outside",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert "workspace 之外" in result.error
+
+def test_search_text_respects_max_matches(
+    tmp_path,
+) -> None:
+    """超过 max_matches 时应截断搜索结果。"""
+
+    (tmp_path / "data.txt").write_text(
+        "error one\n"
+        "error two\n"
+        "error three\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "search_text",
+        {
+            "query": "error",
+            "max_matches": 2,
+        },
+    )
+
+    assert result.ok is True
+    assert result.data["match_count"] == 2
+    assert result.data["truncated"] is True
+
+
+

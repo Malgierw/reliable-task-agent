@@ -182,6 +182,129 @@ def list_workspace_files(
         "truncated": truncated,
     }
 
+class SearchTextArgs(BaseModel):
+    """工作区文本搜索工具的输入参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(
+        min_length=1,
+        description="需要搜索的文本。",
+    )
+    path: str = Field(
+        default=".",
+        description="从 workspace 中哪个相对目录开始搜索。",
+    )
+    recursive: bool = True
+    case_sensitive: bool = False
+    max_matches: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+    )
+
+def search_text(
+    args: SearchTextArgs,
+    workspace: Path,
+) -> dict[str, object]:
+    """安全搜索 workspace 内文本文件中的内容。"""
+
+    workspace = workspace.resolve()
+
+    target = (
+        workspace / args.path
+    ).resolve()
+
+    try:
+        target.relative_to(workspace)
+    except ValueError as exc:
+        raise ValueError(
+            "不允许访问 workspace 之外的路径。"
+        ) from exc
+
+    if not target.exists():
+        raise FileNotFoundError(
+            f"路径不存在：{args.path}"
+        )
+
+    if not target.is_dir():
+        raise ValueError(
+            f"目标不是目录：{args.path}"
+        )
+
+    if args.recursive:
+        candidates = target.rglob("*")
+    else:
+        candidates = target.iterdir()
+
+    matches: list[dict[str, object]] = []
+    files_scanned = 0
+    skipped_files: list[str] = []
+    truncated = False
+
+    search_query = (
+        args.query
+        if args.case_sensitive
+        else args.query.lower()
+    )
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+
+        relative_path = path.relative_to(
+            workspace
+        ).as_posix()
+
+        try:
+            content = path.read_text(
+                encoding="utf-8"
+            )
+        except (UnicodeDecodeError, OSError):
+            skipped_files.append(relative_path)
+            continue
+
+        files_scanned += 1
+
+        for line_number, line in enumerate(
+            content.splitlines(),
+            start=1,
+        ):
+            searchable_line = (
+                line
+                if args.case_sensitive
+                else line.lower()
+            )
+
+            if search_query not in searchable_line:
+                continue
+
+            if len(matches) >= args.max_matches:
+                truncated = True
+                break
+
+            matches.append(
+                {
+                    "path": relative_path,
+                    "line_number": line_number,
+                    "line": line,
+                }
+            )
+
+        if truncated:
+            break
+
+    return {
+        "query": args.query,
+        "path": args.path,
+        "recursive": args.recursive,
+        "case_sensitive": args.case_sensitive,
+        "matches": matches,
+        "match_count": len(matches),
+        "files_scanned": files_scanned,
+        "skipped_files": skipped_files,
+        "truncated": truncated,
+    }
 
 def build_default_registry(
     workspace: str | Path = ".",
@@ -236,6 +359,26 @@ def build_default_registry(
         ),
         args_model=ListWorkspaceFilesArgs,
         handler=handle_list_workspace_files,
+    )
+
+    def handle_search_text(
+        args: SearchTextArgs,
+    ) -> dict[str, object]:
+        return search_text(
+            args,
+            workspace_path,
+        )
+        
+    registry.register(
+        name="search_text",
+        description=(
+            "在工作区的 UTF-8 文本文件中搜索指定文本，"
+            "返回匹配文件、行号和对应文本。"
+            "支持递归搜索和大小写控制，"
+            "不能访问 workspace 之外的路径。"
+        ),
+        args_model=SearchTextArgs,
+        handler=handle_search_text,
     )
 
     return registry
