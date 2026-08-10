@@ -404,17 +404,17 @@ class AgentLoop:
                         mode="json"
                     )
 
-                    if result.ok:
-                        checkpoint.record_tool_call(
-                            CompletedToolCall(
-                                tool_call_id=tool_call.id,
-                                tool_name=tool_name,
-                                arguments=arguments,
-                                result=result_data,
-                            )
+                    
+                    checkpoint.record_tool_call(
+                        CompletedToolCall(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            result=result_data,
                         )
+                    )
 
-                        self._persist_checkpoint(checkpoint)
+                    self._persist_checkpoint(checkpoint)
 
                     self._record_event(
                         trace=trace,
@@ -502,6 +502,216 @@ class AgentLoop:
 
         raise RuntimeError(error_message)
 
+    def _recover_pending_tool_calls(
+        self,
+        *,
+        checkpoint: AgentCheckpoint,
+        trace: RunTrace,
+    ) -> None:
+        """恢复尚未写入 messages 的工具执行结果。"""
+
+        messages = deepcopy(checkpoint.messages)
+
+        if not messages:
+            return
+
+        # 从后往前寻找最近一次要求调用工具的 assistant 消息。
+        assistant_index: int | None = None
+
+        for index in range(
+            len(messages) - 1,
+            -1,
+            -1,
+        ):
+            message = messages[index]
+
+            if (
+                message.get("role") == "assistant"
+                and message.get("tool_calls")
+            ):
+                assistant_index = index
+                break
+
+        if assistant_index is None:
+            return
+
+        assistant_message = messages[
+            assistant_index
+        ]
+
+        tool_calls = assistant_message.get(
+            "tool_calls",
+            [],
+        )
+
+        # 看看哪些工具结果已经存在于 messages。
+        responded_tool_call_ids = {
+            message.get("tool_call_id")
+            for message in messages[
+                assistant_index + 1:
+            ]
+            if message.get("role") == "tool"
+        }
+
+        changed = False
+
+        for tool_call in tool_calls:
+            tool_call_id = tool_call["id"]
+
+            # 已经有 tool message，就不再处理。
+            if tool_call_id in responded_tool_call_ids:
+                continue
+
+            function_data = tool_call["function"]
+
+            tool_name = function_data["name"]
+            raw_arguments = function_data["arguments"]
+
+            saved_call = (
+                checkpoint.completed_tool_calls.get(
+                    tool_call_id
+                )
+            )
+
+            # 情况 1：
+            # 工具已经执行过，只是 tool message 没写进去。
+            if saved_call is not None:
+                result_data = saved_call.result
+
+                self._record_event(
+                    trace=trace,
+                    step=checkpoint.next_step,
+                    event_type="tool_result",
+                    details={
+                        "tool_call_id": tool_call_id,
+                        "replayed_from_checkpoint": True,
+                        **result_data,
+                    },
+                )
+
+            # 情况 2：
+            # 工具连执行都还没执行。
+            else:
+                try:
+                    arguments = json.loads(
+                        raw_arguments
+                    )
+
+                    if not isinstance(arguments, dict):
+                        raise ValueError(
+                            "工具参数必须是 JSON 对象。"
+                        )
+
+                    self._record_event(
+                        trace=trace,
+                        step=checkpoint.next_step,
+                        event_type="tool_call",
+                        details={
+                            "tool_call_id": tool_call_id,
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                            "resumed": True,
+                        },
+                    )
+
+                    result = self.registry.execute(
+                        tool_name,
+                        arguments,
+                    )
+
+                    result_data = result.model_dump(
+                        mode="json"
+                    )
+
+                    checkpoint.record_tool_call(
+                        CompletedToolCall(
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            result=result_data,
+                        )
+                    )
+
+                    self._persist_checkpoint(
+                        checkpoint
+                    )
+
+                    self._record_event(
+                        trace=trace,
+                        step=checkpoint.next_step,
+                        event_type="tool_result",
+                        details={
+                            "tool_call_id": tool_call_id,
+                            "resumed": True,
+                            **result_data,
+                        },
+                    )
+
+                except (
+                    json.JSONDecodeError,
+                    ValueError,
+                ) as exc:
+                    result_data = {
+                        "ok": False,
+                        "tool_name": tool_name,
+                        "data": None,
+                        "error": (
+                            f"工具参数解析失败：{exc}"
+                        ),
+                    }
+
+                    self._record_event(
+                        trace=trace,
+                        step=checkpoint.next_step,
+                        event_type="tool_result",
+                        details={
+                            "tool_call_id": tool_call_id,
+                            "resumed": True,
+                            **result_data,
+                        },
+                    )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(
+                        result_data,
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+
+            responded_tool_call_ids.add(
+                tool_call_id
+            )
+
+            changed = True
+
+        if not changed:
+            return
+
+        # 所有工具都有结果以后，才允许进入下一轮模型调用。
+        expected_ids = {
+            tool_call["id"]
+            for tool_call in tool_calls
+        }
+
+        if expected_ids.issubset(
+            responded_tool_call_ids
+        ):
+            checkpoint.messages = deepcopy(
+                messages
+            )
+
+            checkpoint.advance_to(
+                checkpoint.next_step + 1
+            )
+
+            self._persist_checkpoint(
+                checkpoint
+            )
+
     def resume(self, run_id: str) -> str:
         """根据 run_id 恢复一个已保存的任务。"""
 
@@ -526,11 +736,32 @@ class AgentLoop:
 
             return checkpoint.final_answer
 
-        messages = deepcopy(checkpoint.messages)
-        start_step = checkpoint.next_step
+        # messages = deepcopy(checkpoint.messages)
+        # start_step = checkpoint.next_step
 
+        # checkpoint.mark_running()
+        # self._persist_checkpoint(checkpoint)
+
+        # return self._continue_run(
+        #     messages=messages,
+        #     trace=trace,
+        #     checkpoint=checkpoint,
+        #     start_step=start_step,
+        # )
+        
         checkpoint.mark_running()
         self._persist_checkpoint(checkpoint)
+
+        self._recover_pending_tool_calls(
+            checkpoint=checkpoint,
+            trace=trace,
+        )
+
+        messages = deepcopy(
+            checkpoint.messages
+        )
+
+        start_step = checkpoint.next_step
 
         return self._continue_run(
             messages=messages,
@@ -538,4 +769,3 @@ class AgentLoop:
             checkpoint=checkpoint,
             start_step=start_step,
         )
-

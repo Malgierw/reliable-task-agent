@@ -11,7 +11,10 @@ from reliable_task_agent.agent_loop import AgentLoop
 from reliable_task_agent.tools.builtin import build_default_registry
 from reliable_task_agent.trace_store import TraceStore
 from reliable_task_agent.checkpoint_store import CheckpointStore
-from reliable_task_agent.checkpoint import AgentCheckpoint
+from reliable_task_agent.checkpoint import (
+    AgentCheckpoint,
+    CompletedToolCall,
+)
 
 
 @dataclass
@@ -782,6 +785,232 @@ def test_agent_resume_requires_checkpoint_store() -> None:
     ):
         agent.resume("e" * 32)
 
+def test_resume_reuses_completed_tool_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """恢复时不得重复执行已经完成的工具调用。"""
+
+    run_id = "f" * 32
+    tool_call_id = "call_replay_001"
+
+    checkpoint = AgentCheckpoint(
+        run_id=run_id,
+        next_step=1,
+        messages=[
+            {
+                "role": "system",
+                "content": "系统提示词",
+            },
+            {
+                "role": "user",
+                "content": "计算容量。",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "index": 0,
+                        "function": {
+                            "name": (
+                                "calculate_shannon_capacity"
+                            ),
+                            "arguments": (
+                                '{"bandwidth_hz": '
+                                '20000000, '
+                                '"snr_db": 10}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ],
+    )
+
+    checkpoint.record_tool_call(
+        CompletedToolCall(
+            tool_call_id=tool_call_id,
+            tool_name=(
+                "calculate_shannon_capacity"
+            ),
+            arguments={
+                "bandwidth_hz": 20_000_000,
+                "snr_db": 10,
+            },
+            result={
+                "ok": True,
+                "tool_name": (
+                    "calculate_shannon_capacity"
+                ),
+                "data": {
+                    "capacity_mbps": 69.1886,
+                },
+                "error": None,
+            },
+        )
+    )
+
+    checkpoint.mark_failed(
+        "模拟工具执行后程序中断"
+    )
+
+    store = CheckpointStore(
+        tmp_path / "runs"
+    )
+    store.save(checkpoint)
+
+    registry = build_default_registry()
+
+    # 如果恢复过程再次调用工具，
+    # 测试应立刻失败。
+    def fail_if_executed(
+        *_: Any,
+        **__: Any,
+    ) -> Any:
+        raise AssertionError(
+            "已经完成的工具不应重复执行"
+        )
+
+    monkeypatch.setattr(
+        registry,
+        "execute",
+        fail_if_executed,
+    )
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="恢复任务成功。",
+            )
+        ]
+    )
+
+    agent = AgentLoop(
+        registry,
+        client=fake_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    answer = agent.resume(run_id)
+
+    assert answer == "恢复任务成功。"
+
+    # 模型收到的上下文中应该已经补上 tool message。
+    request_messages = (
+        fake_client.completions
+        .requests[0]["messages"]
+    )
+
+    assert request_messages[-1]["role"] == (
+        "tool"
+    )
+
+    assert request_messages[-1][
+        "tool_call_id"
+    ] == tool_call_id
+
+def test_resume_executes_pending_tool_once(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """尚未执行的 pending tool 应在恢复时执行一次。"""
+
+    run_id = "1" * 32
+    tool_call_id = "call_pending_001"
+
+    checkpoint = AgentCheckpoint(
+        run_id=run_id,
+        next_step=1,
+        messages=[
+            {
+                "role": "system",
+                "content": "系统提示词",
+            },
+            {
+                "role": "user",
+                "content": "计算容量。",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "index": 0,
+                        "function": {
+                            "name": (
+                                "calculate_shannon_capacity"
+                            ),
+                            "arguments": (
+                                '{"bandwidth_hz": '
+                                '20000000, '
+                                '"snr_db": 10}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ],
+    )
+
+    checkpoint.mark_failed(
+        "模拟工具执行前程序中断"
+    )
+
+    store = CheckpointStore(
+        tmp_path / "runs"
+    )
+    store.save(checkpoint)
+
+    registry = build_default_registry()
+
+    original_execute = registry.execute
+    execute_calls: list[str] = []
+
+    def counted_execute(
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        execute_calls.append(name)
+
+        return original_execute(
+            name,
+            arguments,
+        )
+
+    monkeypatch.setattr(
+        registry,
+        "execute",
+        counted_execute,
+    )
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="恢复任务成功。",
+            )
+        ]
+    )
+
+    agent = AgentLoop(
+        registry,
+        client=fake_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    answer = agent.resume(run_id)
+
+    assert answer == "恢复任务成功。"
+
+    assert execute_calls == [
+        "calculate_shannon_capacity"
+    ]
 
 
 
