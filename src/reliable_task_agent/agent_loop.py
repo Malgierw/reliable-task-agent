@@ -78,7 +78,9 @@ class AgentLoop:
         sleep_fn: Callable[[float], None] = time.sleep,
         trace_store: TraceStore | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        fault_hook: Callable[[str], None] | None = None,
     ) -> None:
+        
         if client is None and model is None:
             client, model = create_client()
         elif client is None or model is None:
@@ -106,10 +108,21 @@ class AgentLoop:
         self.max_model_retries = max_model_retries
         self.retry_delay_seconds = retry_delay_seconds
         self.sleep_fn = sleep_fn
-        self.last_trace: RunTrace | None = None
         self.trace_store = trace_store
         self.checkpoint_store = checkpoint_store
+        self.fault_hook = fault_hook
+        
+        self.last_trace: RunTrace | None = None
         self.last_checkpoint: AgentCheckpoint | None = None
+        
+    def _maybe_inject_fault(
+        self,
+        stage: str,
+    ) -> None:
+        """测试环境下，在指定执行阶段主动模拟故障。"""
+
+        if self.fault_hook is not None:
+            self.fault_hook(stage)
 
     def _persist_trace(self, trace: RunTrace) -> None:
         """在配置了 TraceStore 时保存当前执行轨迹。"""
@@ -394,7 +407,11 @@ class AgentLoop:
                             "arguments": arguments,
                         },
                     )
-
+                    
+                
+                    self._maybe_inject_fault(
+                        "before_tool_execute"
+                    )
                     result = self.registry.execute(
                         tool_name,
                         arguments,
@@ -415,6 +432,10 @@ class AgentLoop:
                     )
 
                     self._persist_checkpoint(checkpoint)
+
+                    self._maybe_inject_fault(
+                        "after_tool_checkpoint"
+                    )
 
                     self._record_event(
                         trace=trace,

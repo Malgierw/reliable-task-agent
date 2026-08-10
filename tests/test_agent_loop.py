@@ -1012,6 +1012,142 @@ def test_resume_executes_pending_tool_once(
         "calculate_shannon_capacity"
     ]
 
+def test_resume_after_crash_does_not_repeat_tool(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """工具执行并写入 Checkpoint 后崩溃，恢复时不得重复执行工具。"""
 
+    store = CheckpointStore(
+        tmp_path / "runs"
+    )
+
+    registry = build_default_registry()
+
+    original_execute = registry.execute
+
+    execute_calls: list[str] = []
+
+    def counted_execute(
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        execute_calls.append(name)
+
+        return original_execute(
+            name,
+            arguments,
+        )
+
+    monkeypatch.setattr(
+        registry,
+        "execute",
+        counted_execute,
+    )
+
+    def crash_after_checkpoint(
+        stage: str,
+    ) -> None:
+        if stage == "after_tool_checkpoint":
+            raise RuntimeError(
+                "模拟工具执行后的程序崩溃"
+            )
+
+    first_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_crash_001",
+                        function=FakeFunction(
+                            name=(
+                                "calculate_shannon_capacity"
+                            ),
+                            arguments=(
+                                '{"bandwidth_hz": '
+                                '20000000, '
+                                '"snr_db": 10}'
+                            ),
+                        ),
+                    )
+                ],
+            )
+        ]
+    )
+
+    first_agent = AgentLoop(
+        registry,
+        client=first_client,
+        model="fake-model",
+        checkpoint_store=store,
+        fault_hook=crash_after_checkpoint,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="模拟工具执行后的程序崩溃",
+    ):
+        first_agent.run(
+            "计算 20 MHz、10 dB 时的香农容量。"
+        )
+
+    # 第一次运行时，工具确实执行过一次。
+    assert execute_calls == [
+        "calculate_shannon_capacity"
+    ]
+
+    assert first_agent.last_checkpoint is not None
+
+    run_id = first_agent.last_checkpoint.run_id
+
+    crashed_checkpoint = store.load(run_id)
+
+    # 即使程序随后崩溃，
+    # Checkpoint 中已经存在该工具的执行结果。
+    assert (
+        "call_crash_001"
+        in crashed_checkpoint.completed_tool_calls
+    )
+
+    second_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="恢复成功，容量约为 69.19 Mbps。",
+            )
+        ]
+    )
+
+    resumed_agent = AgentLoop(
+        registry,
+        client=second_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    answer = resumed_agent.resume(run_id)
+
+    assert answer == (
+        "恢复成功，容量约为 69.19 Mbps。"
+    )
+
+    # 核心断言：
+    # resume 后工具调用次数仍然只有一次。
+    assert execute_calls == [
+        "calculate_shannon_capacity"
+    ]
+
+    # 恢复时，应把保存的工具结果补进 messages。
+    request_messages = (
+        second_client
+        .completions
+        .requests[0]["messages"]
+    )
+
+    assert request_messages[-1]["role"] == "tool"
+
+    assert request_messages[-1][
+        "tool_call_id"
+    ] == "call_crash_001"
 
 
