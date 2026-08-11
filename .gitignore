@@ -12,3 +12,5 @@ wheels/
 .env
 
 runs/
+
+demo_workspace/analysis_report.md

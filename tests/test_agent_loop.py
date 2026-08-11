@@ -1176,7 +1176,6 @@ def test_full_demo_recovers_side_effect_and_verifies(
         "config.json",
         "experiment_notes.md",
         "results.csv",
-        "expected_metrics.json",
     ]:
         shutil.copy2(
             demo_source / filename,
