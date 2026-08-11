@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from copy import deepcopy
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -1150,4 +1152,410 @@ def test_resume_after_crash_does_not_repeat_tool(
         "tool_call_id"
     ] == "call_crash_001"
 
+def test_full_demo_recovers_side_effect_and_verifies(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """完整 Demo 应在副作用后崩溃，并通过 Resume 与 Verifier 完成任务。"""
+
+    # -------------------------------------------------
+    # 1. 准备一份隔离的 demo_workspace
+    # -------------------------------------------------
+
+    demo_source = (
+        Path(__file__).resolve().parents[1]
+        / "demo_workspace"
+    )
+
+    workspace = (
+        tmp_path / "demo_workspace"
+    )
+    workspace.mkdir()
+
+    for filename in [
+        "config.json",
+        "experiment_notes.md",
+        "results.csv",
+        "expected_metrics.json",
+    ]:
+        shutil.copy2(
+            demo_source / filename,
+            workspace / filename,
+        )
+
+    # -------------------------------------------------
+    # 2. Trace 和 Checkpoint 共用同一个 run 目录
+    # -------------------------------------------------
+
+    runs_dir = tmp_path / "runs"
+
+    checkpoint_store = CheckpointStore(
+        runs_dir
+    )
+
+    trace_store = TraceStore(
+        runs_dir
+    )
+
+    registry = build_default_registry(
+        workspace
+    )
+
+    # 记录所有真实发生过的工具执行。
+    original_execute = registry.execute
+
+    execute_calls: list[str] = []
+
+    def counted_execute(
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        execute_calls.append(name)
+
+        return original_execute(
+            name,
+            arguments,
+        )
+
+    monkeypatch.setattr(
+        registry,
+        "execute",
+        counted_execute,
+    )
+
+    # -------------------------------------------------
+    # 3. 第一次运行：
+    #    发现文件 → 阅读配置/说明 → 搜索 → CSV 分析
+    #    → 写报告 → 崩溃
+    # -------------------------------------------------
+
+    first_client = FakeClient(
+        messages=[
+            # Step 1: 发现文件
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_list_files",
+                        function=FakeFunction(
+                            name="list_workspace_files",
+                            arguments=(
+                                '{"path": ".", '
+                                '"recursive": true}'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+
+            # Step 2: 读取配置
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_read_config",
+                        function=FakeFunction(
+                            name="read_text_file",
+                            arguments=(
+                                '{"path": "config.json"}'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+
+            # Step 3: 读取实验说明
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_read_notes",
+                        function=FakeFunction(
+                            name="read_text_file",
+                            arguments=(
+                                '{"path": '
+                                '"experiment_notes.md"}'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+
+            # Step 4: 搜索关键规则
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_search_rules",
+                        function=FakeFunction(
+                            name="search_text",
+                            arguments=(
+                                '{"query": '
+                                '"source of truth"}'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+
+            # Step 5: 确定性分析 CSV
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_analyze_csv",
+                        function=FakeFunction(
+                            name="analyze_csv",
+                            arguments=(
+                                '{"path": "results.csv"}'
+                            ),
+                        ),
+                    )
+                ],
+            ),
+
+            # Step 6: 产生真实副作用——写报告
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_write_report",
+                        function=FakeFunction(
+                            name="write_analysis_report",
+                            arguments=(
+                                "{"
+                                '"path": "analysis_report.md", '
+                                '"experiment_name": '
+                                '"wireless_link_reliability_evaluation", '
+                                '"overall_status": "FAIL", '
+                                '"summary": '
+                                '"5 runs were analyzed and '
+                                '2 runs violated configured thresholds.", '
+                                '"failed_runs": '
+                                '["run_003", "run_005"], '
+                                '"violations": ['
+                                '"run_003: throughput_mbps 74 < 80", '
+                                '"run_005: throughput_mbps 79 < 80", '
+                                '"run_005: latency_ms 24 > 20", '
+                                '"run_005: packet_loss_pct 1.4 > 1.0"'
+                                "], "
+                                '"aggregate_metrics": {'
+                                '"throughput_mbps": {'
+                                '"count": 5, '
+                                '"min": 74.0, '
+                                '"max": 92.0, '
+                                '"mean": 83.6'
+                                "}, "
+                                '"latency_ms": {'
+                                '"count": 5, '
+                                '"min": 12.0, '
+                                '"max": 24.0, '
+                                '"mean": 16.8'
+                                "}, "
+                                '"packet_loss_pct": {'
+                                '"count": 5, '
+                                '"min": 0.2, '
+                                '"max": 1.4, '
+                                '"mean": 0.66'
+                                "}"
+                                "}"
+                                "}"
+                            ),
+                        ),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    # after_tool_checkpoint 会被很多工具经过。
+    # 我们只在第 6 次，也就是 write_analysis_report
+    # 已执行且结果已经落盘之后制造崩溃。
+    checkpoint_count = 0
+
+    def crash_after_report_checkpoint(
+        stage: str,
+    ) -> None:
+        nonlocal checkpoint_count
+
+        if stage != "after_tool_checkpoint":
+            return
+
+        checkpoint_count += 1
+
+        if checkpoint_count == 6:
+            raise RuntimeError(
+                "模拟报告写入后的程序崩溃"
+            )
+
+    first_agent = AgentLoop(
+        registry,
+        client=first_client,
+        model="fake-model",
+        max_steps=10,
+        checkpoint_store=checkpoint_store,
+        trace_store=trace_store,
+        fault_hook=crash_after_report_checkpoint,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="模拟报告写入后的程序崩溃",
+    ):
+        first_agent.run(
+            "分析实验结果，生成报告并验证报告。"
+        )
+
+    # -------------------------------------------------
+    # 4. 崩溃虽然发生了，但报告应该已经真实写入磁盘
+    # -------------------------------------------------
+
+    report_path = (
+        workspace / "analysis_report.md"
+    )
+
+    assert report_path.is_file()
+
+    report_content = report_path.read_text(
+        encoding="utf-8"
+    )
+
+    assert "FAIL" in report_content
+    assert "run_003" in report_content
+    assert "run_005" in report_content
+
+    assert first_agent.last_checkpoint is not None
+
+    run_id = (
+        first_agent.last_checkpoint.run_id
+    )
+
+    crashed_checkpoint = (
+        checkpoint_store.load(run_id)
+    )
+
+    assert (
+        "call_write_report"
+        in crashed_checkpoint.completed_tool_calls
+    )
+
+    # 到崩溃时，写报告工具只能真正执行过一次。
+    assert execute_calls.count(
+        "write_analysis_report"
+    ) == 1
+
+    # -------------------------------------------------
+    # 5. 模拟程序重启并 Resume
+    #
+    # Resume 应：
+    #   复用 write_analysis_report 的旧结果
+    #   不重新写报告
+    #   然后执行 Verifier
+    # -------------------------------------------------
+
+    second_client = FakeClient(
+        messages=[
+            # Resume 后下一步调用 Verifier
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_verify_report",
+                        function=FakeFunction(
+                            name="verify_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            ),
+
+            # Verifier 通过以后结束任务
+            FakeMessage(
+                content="SUCCESS",
+            ),
+        ]
+    )
+
+    resumed_agent = AgentLoop(
+        registry,
+        client=second_client,
+        model="fake-model",
+        max_steps=10,
+        checkpoint_store=checkpoint_store,
+        trace_store=trace_store,
+    )
+
+    answer = resumed_agent.resume(
+        run_id
+    )
+
+    assert answer == "SUCCESS"
+
+    # -------------------------------------------------
+    # 6. 最关键：
+    #    Resume 没有重复产生副作用
+    # -------------------------------------------------
+
+    assert execute_calls.count(
+        "write_analysis_report"
+    ) == 1
+
+    assert execute_calls.count(
+        "verify_analysis_report"
+    ) == 1
+
+    # -------------------------------------------------
+    # 7. Verifier 必须真的给出 verification_passed=True
+    # -------------------------------------------------
+
+    assert resumed_agent.last_trace is not None
+
+    verification_events = [
+        event
+        for event in resumed_agent.last_trace.events
+        if (
+            event.event_type == "tool_result"
+            and event.details.get("tool_name")
+            == "verify_analysis_report"
+        )
+    ]
+
+    assert len(
+        verification_events
+    ) == 1
+
+    verification_result = (
+        verification_events[0]
+        .details["data"]
+    )
+
+    assert (
+        verification_result[
+            "verification_passed"
+        ]
+        is True
+    )
+
+    assert (
+        verification_result["errors"]
+        == []
+    )
+
+    # -------------------------------------------------
+    # 8. 原来的同一个 run 最终进入 completed
+    # -------------------------------------------------
+
+    final_checkpoint = (
+        checkpoint_store.load(run_id)
+    )
+
+    assert (
+        final_checkpoint.status
+        == "completed"
+    )
+
+    assert (
+        final_checkpoint.final_answer
+        == "SUCCESS"
+    )
 
