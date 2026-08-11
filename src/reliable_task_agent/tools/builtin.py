@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import json
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -661,6 +662,453 @@ def write_analysis_report(
         "overall_status": args.overall_status,
     }
 
+class VerifyAnalysisReportArgs(BaseModel):
+    """分析报告确定性验证工具的输入参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_path: str = Field(
+        default="analysis_report.md",
+        min_length=1,
+        description="待验证的 Markdown 报告路径。",
+    )
+
+    config_path: str = Field(
+        default="config.json",
+        min_length=1,
+        description="实验验收配置路径。",
+    )
+
+    results_path: str = Field(
+        default="results.csv",
+        min_length=1,
+        description="实验结果 CSV 路径。",
+    )
+
+    tolerance: float = Field(
+        default=1e-6,
+        gt=0,
+        le=1,
+        description="数值指标比较时使用的绝对误差容限。",
+    )
+
+def _parse_analysis_report(
+    content: str,
+) -> dict[str, object]:
+    """解析 write_analysis_report 生成的固定格式报告。"""
+
+    lines = content.splitlines()
+
+    reported_status: str | None = None
+    failed_runs: list[str] = []
+    aggregate_metrics: dict[
+        str,
+        dict[str, float],
+    ] = {}
+
+    current_section: str | None = None
+    current_metric: str | None = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+
+        if line == "## Overall Status":
+            current_section = "status"
+            current_metric = None
+            continue
+
+        if line == "## Failed Runs":
+            current_section = "failed_runs"
+            current_metric = None
+            continue
+
+        if line == "## Aggregate Metrics":
+            current_section = "aggregate_metrics"
+            current_metric = None
+            continue
+
+        if line.startswith("## "):
+            current_section = None
+            current_metric = None
+            continue
+
+        if not line:
+            continue
+
+        if (
+            current_section == "status"
+            and reported_status is None
+        ):
+            reported_status = line
+            continue
+
+        if current_section == "failed_runs":
+            if line.startswith("- "):
+                value = line[2:].strip()
+
+                if value != "None":
+                    failed_runs.append(value)
+
+            continue
+
+        if current_section == "aggregate_metrics":
+            if line.startswith("### "):
+                current_metric = line[4:].strip()
+
+                aggregate_metrics[
+                    current_metric
+                ] = {}
+
+                continue
+
+            if (
+                current_metric is not None
+                and line.startswith("- ")
+                and ":" in line
+            ):
+                key, value = line[2:].split(
+                    ":",
+                    maxsplit=1,
+                )
+
+                try:
+                    aggregate_metrics[
+                        current_metric
+                    ][key.strip()] = float(
+                        value.strip()
+                    )
+                except ValueError:
+                    continue
+
+    return {
+        "overall_status": reported_status,
+        "failed_runs": failed_runs,
+        "aggregate_metrics": aggregate_metrics,
+    }
+
+def verify_analysis_report(
+    args: VerifyAnalysisReportArgs,
+    workspace: Path,
+) -> dict[str, object]:
+    """根据原始配置和 CSV 确定性验证分析报告。"""
+
+    workspace = workspace.resolve()
+
+    def resolve_inside_workspace(
+        relative_path: str,
+    ) -> Path:
+        path = (
+            workspace / relative_path
+        ).resolve()
+
+        try:
+            path.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError(
+                "不允许访问 workspace 之外的路径。"
+            ) from exc
+
+        return path
+
+    report_path = resolve_inside_workspace(
+        args.report_path
+    )
+    config_path = resolve_inside_workspace(
+        args.config_path
+    )
+    results_path = resolve_inside_workspace(
+        args.results_path
+    )
+
+    if not report_path.is_file():
+        raise FileNotFoundError(
+            f"报告不存在：{args.report_path}"
+        )
+
+    if report_path.suffix.lower() != ".md":
+        raise ValueError(
+            "待验证报告必须是 .md 文件。"
+        )
+
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"配置文件不存在：{args.config_path}"
+        )
+
+    if not results_path.is_file():
+        raise FileNotFoundError(
+            f"结果文件不存在：{args.results_path}"
+        )
+
+    if results_path.suffix.lower() != ".csv":
+        raise ValueError(
+            "实验结果必须是 .csv 文件。"
+        )
+
+    config = json.loads(
+        config_path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    throughput_target = float(
+        config["throughput_target_mbps"]
+    )
+    latency_limit = float(
+        config["latency_limit_ms"]
+    )
+    packet_loss_limit = float(
+        config["packet_loss_limit_pct"]
+    )
+    required_runs = int(
+        config["required_runs"]
+    )
+
+    rows: list[dict[str, str]] = []
+
+    with results_path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+        reader = csv.DictReader(file)
+
+        required_columns = {
+            "run_id",
+            "throughput_mbps",
+            "latency_ms",
+            "packet_loss_pct",
+        }
+
+        fieldnames = set(
+            reader.fieldnames or []
+        )
+
+        if not required_columns.issubset(
+            fieldnames
+        ):
+            raise ValueError(
+                "CSV 缺少 Verifier 所需的列。"
+            )
+
+        rows = list(reader)
+
+    failed_runs: list[str] = []
+
+    metric_values: dict[
+        str,
+        list[float],
+    ] = {
+        "throughput_mbps": [],
+        "latency_ms": [],
+        "packet_loss_pct": [],
+    }
+
+    for row in rows:
+        run_id = row["run_id"]
+
+        throughput = float(
+            row["throughput_mbps"]
+        )
+        latency = float(
+            row["latency_ms"]
+        )
+        packet_loss = float(
+            row["packet_loss_pct"]
+        )
+
+        metric_values[
+            "throughput_mbps"
+        ].append(throughput)
+
+        metric_values[
+            "latency_ms"
+        ].append(latency)
+
+        metric_values[
+            "packet_loss_pct"
+        ].append(packet_loss)
+
+        violated = (
+            throughput < throughput_target
+            or latency > latency_limit
+            or packet_loss > packet_loss_limit
+        )
+
+        if violated:
+            failed_runs.append(run_id)
+
+    row_count_matches = (
+        len(rows) == required_runs
+    )
+
+    expected_status = (
+        "PASS"
+        if row_count_matches
+        and not failed_runs
+        else "FAIL"
+    )
+
+    expected_metrics: dict[
+        str,
+        dict[str, float],
+    ] = {}
+
+    for metric_name, values in (
+        metric_values.items()
+    ):
+        if not values:
+            continue
+
+        expected_metrics[metric_name] = {
+            "count": float(len(values)),
+            "min": min(values),
+            "max": max(values),
+            "mean": sum(values) / len(values),
+        }
+
+    report_content = report_path.read_text(
+        encoding="utf-8"
+    )
+
+    parsed_report = _parse_analysis_report(
+        report_content
+    )
+
+    reported_status = parsed_report[
+        "overall_status"
+    ]
+
+    reported_failed_runs = parsed_report[
+        "failed_runs"
+    ]
+
+    reported_metrics = parsed_report[
+        "aggregate_metrics"
+    ]
+
+    status_matches = (
+        reported_status == expected_status
+    )
+
+    failed_runs_match = (
+        set(reported_failed_runs)
+        == set(failed_runs)
+    )
+
+    metrics_match = True
+    metric_errors: list[str] = []
+
+    for (
+        metric_name,
+        expected_summary,
+    ) in expected_metrics.items():
+
+        reported_summary = (
+            reported_metrics.get(
+                metric_name
+            )
+        )
+
+        if reported_summary is None:
+            metrics_match = False
+            metric_errors.append(
+                f"报告缺少指标：{metric_name}"
+            )
+            continue
+
+        for key, expected_value in (
+            expected_summary.items()
+        ):
+            reported_value = (
+                reported_summary.get(key)
+            )
+
+            if reported_value is None:
+                metrics_match = False
+                metric_errors.append(
+                    f"{metric_name} 缺少 {key}"
+                )
+                continue
+
+            if not math.isclose(
+                float(reported_value),
+                float(expected_value),
+                abs_tol=args.tolerance,
+                rel_tol=0.0,
+            ):
+                metrics_match = False
+                metric_errors.append(
+                    (
+                        f"{metric_name}.{key} "
+                        f"应为 {expected_value}，"
+                        f"报告中为 {reported_value}"
+                    )
+                )
+
+    verification_passed = (
+        row_count_matches
+        and status_matches
+        and failed_runs_match
+        and metrics_match
+    )
+
+    errors: list[str] = []
+
+    if not row_count_matches:
+        errors.append(
+            (
+                f"实验行数应为 {required_runs}，"
+                f"实际为 {len(rows)}"
+            )
+        )
+
+    if not status_matches:
+        errors.append(
+            (
+                f"总体状态应为 {expected_status}，"
+                f"报告中为 {reported_status}"
+            )
+        )
+
+    if not failed_runs_match:
+        errors.append(
+            (
+                "失败 run 集合不匹配："
+                f"应为 {failed_runs}，"
+                f"报告中为 {reported_failed_runs}"
+            )
+        )
+
+    errors.extend(metric_errors)
+
+    return {
+        "verification_passed": (
+            verification_passed
+        ),
+        "expected_status": expected_status,
+        "reported_status": reported_status,
+        "expected_failed_runs": failed_runs,
+        "reported_failed_runs": (
+            reported_failed_runs
+        ),
+        "checks": {
+            "row_count_matches_config": (
+                row_count_matches
+            ),
+            "overall_status_matches": (
+                status_matches
+            ),
+            "failed_runs_match": (
+                failed_runs_match
+            ),
+            "aggregate_metrics_match": (
+                metrics_match
+            ),
+        },
+        "errors": errors,
+    }
+
 def build_default_registry(
     workspace: str | Path = ".",
 ) -> ToolRegistry:
@@ -775,6 +1223,27 @@ def build_default_registry(
         handler=handle_write_analysis_report,
     )
 
+    def handle_verify_analysis_report(
+        args: VerifyAnalysisReportArgs,
+    ) -> dict[str, object]:
+        return verify_analysis_report(
+            args,
+            workspace_path,
+        )
+
+    registry.register(
+        name="verify_analysis_report",
+        description=(
+            "确定性验证分析报告。"
+            "重新读取实验配置和 CSV 原始结果，"
+            "独立计算正确状态、失败 run 和聚合指标，"
+            "再与 Markdown 报告比较。"
+            "verification_passed 决定报告是否真正通过验收。"
+        ),
+        args_model=VerifyAnalysisReportArgs,
+        handler=handle_verify_analysis_report,
+    )
+    
     return registry
 
 

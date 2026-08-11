@@ -784,3 +784,300 @@ def test_write_analysis_report_rejects_non_markdown(
     assert not (
         tmp_path / "config.json"
     ).exists()
+
+def test_verify_analysis_report_success(
+    tmp_path,
+) -> None:
+    """正确报告应通过确定性验证。"""
+
+    (
+        tmp_path / "config.json"
+    ).write_text(
+        """
+{
+  "throughput_target_mbps": 80.0,
+  "latency_limit_ms": 20.0,
+  "packet_loss_limit_pct": 1.0,
+  "required_runs": 3
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (
+        tmp_path / "results.csv"
+    ).write_text(
+        "run_id,throughput_mbps,latency_ms,"
+        "packet_loss_pct,status\n"
+        "run_001,90,10,0.2,ok\n"
+        "run_002,70,15,0.5,warning\n"
+        "run_003,85,25,1.2,failed\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    write_result = registry.execute(
+        "write_analysis_report",
+        {
+            "experiment_name": "demo",
+            "overall_status": "FAIL",
+            "summary": "Two runs violated thresholds.",
+            "failed_runs": [
+                "run_002",
+                "run_003",
+            ],
+            "violations": [
+                "run_002 throughput violation",
+                "run_003 latency and loss violation",
+            ],
+            "aggregate_metrics": {
+                "throughput_mbps": {
+                    "count": 3,
+                    "min": 70,
+                    "max": 90,
+                    "mean": 81.66666666666667,
+                },
+                "latency_ms": {
+                    "count": 3,
+                    "min": 10,
+                    "max": 25,
+                    "mean": 16.666666666666668,
+                },
+                "packet_loss_pct": {
+                    "count": 3,
+                    "min": 0.2,
+                    "max": 1.2,
+                    "mean": (
+                        0.6333333333333333
+                    ),
+                },
+            },
+        },
+    )
+
+    assert write_result.ok is True
+
+    verify_result = registry.execute(
+        "verify_analysis_report",
+        {},
+    )
+
+    assert verify_result.ok is True
+    assert verify_result.data is not None
+
+    assert (
+        verify_result.data[
+            "verification_passed"
+        ]
+        is True
+    )
+
+    assert verify_result.data[
+        "expected_failed_runs"
+    ] == [
+        "run_002",
+        "run_003",
+    ]
+
+    assert verify_result.data["errors"] == []
+
+def test_verify_analysis_report_rejects_wrong_failed_runs(
+    tmp_path,
+) -> None:
+    """报告漏掉失败 run 时，Verifier 必须拒绝。"""
+
+    (
+        tmp_path / "config.json"
+    ).write_text(
+        """
+{
+  "throughput_target_mbps": 80.0,
+  "latency_limit_ms": 20.0,
+  "packet_loss_limit_pct": 1.0,
+  "required_runs": 1
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (
+        tmp_path / "results.csv"
+    ).write_text(
+        "run_id,throughput_mbps,latency_ms,"
+        "packet_loss_pct\n"
+        "run_bad,70,10,0.2\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    write_result = registry.execute(
+        "write_analysis_report",
+        {
+            "experiment_name": "demo",
+            "overall_status": "FAIL",
+            "summary": "summary",
+            "failed_runs": [],
+            "aggregate_metrics": {
+                "throughput_mbps": {
+                    "count": 1,
+                    "min": 70,
+                    "max": 70,
+                    "mean": 70,
+                },
+                "latency_ms": {
+                    "count": 1,
+                    "min": 10,
+                    "max": 10,
+                    "mean": 10,
+                },
+                "packet_loss_pct": {
+                    "count": 1,
+                    "min": 0.2,
+                    "max": 0.2,
+                    "mean": 0.2,
+                },
+            },
+        },
+    )
+
+    assert write_result.ok is True
+
+    result = registry.execute(
+        "verify_analysis_report",
+        {},
+    )
+
+    assert result.ok is True
+
+    # 工具本身成功运行，
+    # 但报告验证没有通过。
+    assert (
+        result.data[
+            "verification_passed"
+        ]
+        is False
+    )
+
+    assert (
+        result.data["checks"][
+            "failed_runs_match"
+        ]
+        is False
+    )
+
+def test_verify_analysis_report_rejects_wrong_metrics(
+    tmp_path,
+) -> None:
+    """报告统计指标错误时，Verifier 必须拒绝。"""
+
+    (
+        tmp_path / "config.json"
+    ).write_text(
+        """
+{
+  "throughput_target_mbps": 80.0,
+  "latency_limit_ms": 20.0,
+  "packet_loss_limit_pct": 1.0,
+  "required_runs": 1
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (
+        tmp_path / "results.csv"
+    ).write_text(
+        "run_id,throughput_mbps,latency_ms,"
+        "packet_loss_pct\n"
+        "run_001,90,10,0.2\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    registry.execute(
+        "write_analysis_report",
+        {
+            "experiment_name": "demo",
+            "overall_status": "PASS",
+            "summary": "summary",
+            "failed_runs": [],
+            "aggregate_metrics": {
+                "throughput_mbps": {
+                    "count": 1,
+                    "min": 90,
+                    "max": 90,
+                    "mean": 999,
+                },
+                "latency_ms": {
+                    "count": 1,
+                    "min": 10,
+                    "max": 10,
+                    "mean": 10,
+                },
+                "packet_loss_pct": {
+                    "count": 1,
+                    "min": 0.2,
+                    "max": 0.2,
+                    "mean": 0.2,
+                },
+            },
+        },
+    )
+
+    result = registry.execute(
+        "verify_analysis_report",
+        {},
+    )
+
+    assert result.ok is True
+
+    assert (
+        result.data[
+            "verification_passed"
+        ]
+        is False
+    )
+
+    assert (
+        result.data["checks"][
+            "aggregate_metrics_match"
+        ]
+        is False
+    )
+
+def test_verify_analysis_report_rejects_outside_path(
+    tmp_path,
+) -> None:
+    """Verifier 不得读取 workspace 之外的报告。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    registry = build_default_registry(
+        workspace
+    )
+
+    result = registry.execute(
+        "verify_analysis_report",
+        {
+            "report_path": "../outside.md",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert result.error is not None
+
+    assert (
+        "workspace 之外"
+        in result.error
+    )
