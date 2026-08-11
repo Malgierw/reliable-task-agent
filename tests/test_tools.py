@@ -608,3 +608,179 @@ def test_analyze_csv_rejects_non_csv(
     assert result.ok is False
     assert result.data is None
     assert ".csv" in result.error
+
+def test_write_analysis_report_success(
+    tmp_path,
+) -> None:
+    """应根据结构化输入真正创建 Markdown 报告。"""
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "write_analysis_report",
+        {
+            "path": "analysis_report.md",
+            "experiment_name": (
+                "wireless_link_reliability_evaluation"
+            ),
+            "overall_status": "FAIL",
+            "summary": (
+                "5 runs were analyzed and "
+                "2 runs violated configured thresholds."
+            ),
+            "failed_runs": [
+                "run_003",
+                "run_005",
+            ],
+            "violations": [
+                (
+                    "run_003: throughput_mbps "
+                    "74 < 80"
+                ),
+                (
+                    "run_005: throughput_mbps "
+                    "79 < 80"
+                ),
+                (
+                    "run_005: latency_ms "
+                    "24 > 20"
+                ),
+                (
+                    "run_005: packet_loss_pct "
+                    "1.4 > 1.0"
+                ),
+            ],
+            "aggregate_metrics": {
+                "throughput_mbps": {
+                    "count": 5,
+                    "min": 74.0,
+                    "max": 92.0,
+                    "mean": 83.6,
+                }
+            },
+        },
+    )
+
+    assert result.ok is True
+    assert result.data is not None
+
+    report_path = (
+        tmp_path / "analysis_report.md"
+    )
+
+    assert report_path.is_file()
+
+    content = report_path.read_text(
+        encoding="utf-8"
+    )
+
+    assert "## Overall Status" in content
+    assert "FAIL" in content
+    assert "run_003" in content
+    assert "run_005" in content
+    assert "83.6" in content
+
+def test_write_analysis_report_rejects_existing_file(
+    tmp_path,
+) -> None:
+    """默认不得覆盖已经存在的报告。"""
+
+    report_path = (
+        tmp_path / "analysis_report.md"
+    )
+
+    report_path.write_text(
+        "existing report",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "write_analysis_report",
+        {
+            "path": "analysis_report.md",
+            "experiment_name": "demo",
+            "overall_status": "FAIL",
+            "summary": "summary",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert result.error is not None
+    assert "已经存在" in result.error
+
+    # 原文件不能被破坏。
+    assert report_path.read_text(
+        encoding="utf-8"
+    ) == "existing report"
+
+def test_write_analysis_report_rejects_outside_path(
+    tmp_path,
+) -> None:
+    """不得通过 .. 在 workspace 外写报告。"""
+
+    workspace = (
+        tmp_path / "workspace"
+    )
+    workspace.mkdir()
+
+    registry = build_default_registry(
+        workspace
+    )
+
+    result = registry.execute(
+        "write_analysis_report",
+        {
+            "path": "../outside.md",
+            "experiment_name": "demo",
+            "overall_status": "FAIL",
+            "summary": "summary",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert result.error is not None
+
+    assert (
+        "workspace 之外"
+        in result.error
+    )
+
+    assert not (
+        tmp_path / "outside.md"
+    ).exists()
+
+def test_write_analysis_report_rejects_non_markdown(
+    tmp_path,
+) -> None:
+    """报告工具不得写入非 Markdown 文件。"""
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "write_analysis_report",
+        {
+            "path": "config.json",
+            "experiment_name": "demo",
+            "overall_status": "FAIL",
+            "summary": "summary",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert result.error is not None
+    assert ".md" in result.error
+
+    assert not (
+        tmp_path / "config.json"
+    ).exists()

@@ -471,6 +471,196 @@ def analyze_csv(
         "truncated": truncated,
     }
 
+class WriteAnalysisReportArgs(BaseModel):
+    """分析报告写入工具的输入参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        default="analysis_report.md",
+        min_length=1,
+        description="相对于 workspace 的 Markdown 报告路径。",
+    )
+
+    experiment_name: str = Field(
+        min_length=1,
+        description="实验名称。",
+    )
+
+    overall_status: str = Field(
+        min_length=1,
+        description="总体结论，例如 PASS 或 FAIL。",
+    )
+
+    summary: str = Field(
+        min_length=1,
+        description="实验结果摘要。",
+    )
+
+    failed_runs: list[str] = Field(
+        default_factory=list,
+        description="违反验收条件的 run_id。",
+    )
+
+    violations: list[str] = Field(
+        default_factory=list,
+        description="具体违反条件的说明。",
+    )
+
+    aggregate_metrics: dict[str, dict[str, float]] = Field(
+        default_factory=dict,
+        description="确定性工具计算得到的聚合指标。",
+    )
+
+    overwrite: bool = Field(
+        default=False,
+        description="是否允许覆盖已经存在的报告。",
+    )
+
+def write_analysis_report(
+    args: WriteAnalysisReportArgs,
+    workspace: Path,
+) -> dict[str, object]:
+    """安全地将结构化分析结果写入 Markdown 报告。"""
+
+    workspace = workspace.resolve()
+
+    report_path = (
+        workspace / args.path
+    ).resolve()
+
+    try:
+        relative_path = report_path.relative_to(
+            workspace
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "不允许在 workspace 之外写入文件。"
+        ) from exc
+
+    if report_path.suffix.lower() != ".md":
+        raise ValueError(
+            "分析报告必须是 .md 文件。"
+        )
+
+    if report_path.exists() and not args.overwrite:
+        raise FileExistsError(
+            f"报告已经存在：{relative_path.as_posix()}"
+        )
+
+    report_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    lines: list[str] = [
+        f"# Analysis Report: {args.experiment_name}",
+        "",
+        "## Overall Status",
+        "",
+        args.overall_status,
+        "",
+        "## Summary",
+        "",
+        args.summary,
+        "",
+        "## Failed Runs",
+        "",
+    ]
+
+    if args.failed_runs:
+        for run_id in args.failed_runs:
+            lines.append(
+                f"- {run_id}"
+            )
+    else:
+        lines.append(
+            "- None"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Violations",
+            "",
+        ]
+    )
+
+    if args.violations:
+        for violation in args.violations:
+            lines.append(
+                f"- {violation}"
+            )
+    else:
+        lines.append(
+            "- None"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Aggregate Metrics",
+            "",
+        ]
+    )
+
+    if args.aggregate_metrics:
+        for metric_name in sorted(
+            args.aggregate_metrics
+        ):
+            metrics = args.aggregate_metrics[
+                metric_name
+            ]
+
+            lines.append(
+                f"### {metric_name}"
+            )
+            lines.append("")
+
+            for key in (
+                "count",
+                "min",
+                "max",
+                "mean",
+            ):
+                if key in metrics:
+                    lines.append(
+                        f"- {key}: {metrics[key]}"
+                    )
+
+            lines.append("")
+    else:
+        lines.append(
+            "No aggregate metrics provided."
+        )
+        lines.append("")
+
+    content = "\n".join(lines)
+
+    temporary_path = report_path.with_suffix(
+        report_path.suffix + ".tmp"
+    )
+
+    temporary_path.write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    temporary_path.replace(
+        report_path
+    )
+
+    return {
+        "path": relative_path.as_posix(),
+        "bytes_written": len(
+            content.encode("utf-8")
+        ),
+        "failed_run_count": len(
+            args.failed_runs
+        ),
+        "overall_status": args.overall_status,
+    }
+
 def build_default_registry(
     workspace: str | Path = ".",
 ) -> ToolRegistry:
@@ -565,4 +755,26 @@ def build_default_registry(
         args_model=AnalyzeCsvArgs,
         handler=handle_analyze_csv,
     )
+    
+    def handle_write_analysis_report(
+        args: WriteAnalysisReportArgs,
+    ) -> dict[str, object]:
+        return write_analysis_report(
+            args,
+            workspace_path,
+        )
+
+    registry.register(
+        name="write_analysis_report",
+        description=(
+            "将结构化实验分析结果写入 workspace 内的 Markdown 报告。"
+            "这是一个具有文件写入副作用的工具。"
+            "默认不覆盖已有文件，且不能写入 workspace 之外。"
+        ),
+        args_model=WriteAnalysisReportArgs,
+        handler=handle_write_analysis_report,
+    )
+
     return registry
+
+
