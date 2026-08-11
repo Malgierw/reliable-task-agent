@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import math
 from pathlib import Path
 
@@ -303,6 +304,170 @@ def search_text(
         "match_count": len(matches),
         "files_scanned": files_scanned,
         "skipped_files": skipped_files,
+        "truncated": truncated,
+    }
+
+class AnalyzeCsvArgs(BaseModel):
+    """CSV 实验结果分析工具的输入参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        min_length=1,
+        description="相对于 workspace 的 CSV 文件路径。",
+    )
+
+    max_rows: int = Field(
+        default=10_000,
+        ge=1,
+        le=100_000,
+        description="最多分析的数据行数。",
+    )
+
+def analyze_csv(
+    args: AnalyzeCsvArgs,
+    workspace: Path,
+) -> dict[str, object]:
+    """安全读取并分析 workspace 内的 CSV 文件。"""
+
+    workspace = workspace.resolve()
+
+    file_path = (
+        workspace / args.path
+    ).resolve()
+
+    try:
+        relative_path = file_path.relative_to(
+            workspace
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "不允许访问 workspace 之外的路径。"
+        ) from exc
+
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"文件不存在：{args.path}"
+        )
+
+    if not file_path.is_file():
+        raise ValueError(
+            f"目标不是文件：{args.path}"
+        )
+
+    if file_path.suffix.lower() != ".csv":
+        raise ValueError(
+            "analyze_csv 只允许分析 .csv 文件。"
+        )
+
+    rows: list[dict[str, str]] = []
+    truncated = False
+
+    with file_path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+        reader = csv.DictReader(file)
+
+        if reader.fieldnames is None:
+            raise ValueError(
+                "CSV 文件缺少表头。"
+            )
+
+        columns = list(reader.fieldnames)
+
+        for row in reader:
+            if len(rows) >= args.max_rows:
+                truncated = True
+                break
+
+            rows.append(
+                {
+                    key: (
+                        value
+                        if value is not None
+                        else ""
+                    )
+                    for key, value in row.items()
+                }
+            )
+
+    missing_values: dict[str, int] = {
+        column: 0
+        for column in columns
+    }
+
+    numeric_values: dict[str, list[float]] = {
+        column: []
+        for column in columns
+    }
+
+    non_empty_counts: dict[str, int] = {
+        column: 0
+        for column in columns
+    }
+
+    numeric_counts: dict[str, int] = {
+        column: 0
+        for column in columns
+    }
+
+    for row in rows:
+        for column in columns:
+            raw_value = row.get(
+                column,
+                "",
+            ).strip()
+
+            if raw_value == "":
+                missing_values[column] += 1
+                continue
+
+            non_empty_counts[column] += 1
+
+            try:
+                numeric_value = float(
+                    raw_value
+                )
+            except ValueError:
+                continue
+
+            numeric_values[column].append(
+                numeric_value
+            )
+            numeric_counts[column] += 1
+
+    numeric_summary: dict[
+        str,
+        dict[str, float | int],
+    ] = {}
+
+    for column in columns:
+        values = numeric_values[column]
+
+        # 只有所有非空值都能转换成数字，
+        # 才把这一列认定为数值列。
+        if (
+            not values
+            or numeric_counts[column]
+            != non_empty_counts[column]
+        ):
+            continue
+
+        numeric_summary[column] = {
+            "count": len(values),
+            "min": min(values),
+            "max": max(values),
+            "mean": sum(values) / len(values),
+        }
+
+    return {
+        "path": relative_path.as_posix(),
+        "columns": columns,
+        "row_count": len(rows),
+        "missing_values": missing_values,
+        "numeric_summary": numeric_summary,
         "truncated": truncated,
     }
 
