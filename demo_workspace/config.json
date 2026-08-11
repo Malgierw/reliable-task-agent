@@ -1,0 +1,8 @@
+{
+  "experiment_name": "wireless_link_reliability_evaluation",
+  "throughput_target_mbps": 80.0,
+  "latency_limit_ms": 20.0,
+  "packet_loss_limit_pct": 1.0,
+  "required_runs": 5,
+  "report_path": "analysis_report.md"
+}

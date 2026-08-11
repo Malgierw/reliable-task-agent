@@ -1,0 +1,6 @@
+run_id,throughput_mbps,latency_ms,packet_loss_pct,status
+run_001,92,12,0.2,ok
+run_002,88,14,0.4,ok
+run_003,74,18,0.8,warning
+run_004,85,16,0.5,ok
+run_005,79,24,1.4,failed
