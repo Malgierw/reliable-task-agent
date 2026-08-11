@@ -546,4 +546,23 @@ def build_default_registry(
         handler=handle_search_text,
     )
 
+    def handle_analyze_csv(
+        args: AnalyzeCsvArgs,
+    ) -> dict[str, object]:
+        return analyze_csv(
+            args,
+            workspace_path,
+        )
+        
+    registry.register(
+        name="analyze_csv",
+        description=(
+            "分析工作区内的 CSV 数据文件，"
+            "返回列名、行数、缺失值统计以及"
+            "数值列的 count、min、max 和 mean。"
+            "不能访问 workspace 之外的路径。"
+        ),
+        args_model=AnalyzeCsvArgs,
+        handler=handle_analyze_csv,
+    )
     return registry

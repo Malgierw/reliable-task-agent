@@ -376,5 +376,235 @@ def test_search_text_respects_max_matches(
     assert result.data["match_count"] == 2
     assert result.data["truncated"] is True
 
+def test_analyze_csv_success(
+    tmp_path,
+) -> None:
+    """应正确分析 CSV 中的数值列。"""
 
+    (
+        tmp_path / "results.csv"
+    ).write_text(
+        "experiment_id,throughput_mbps,latency_ms\n"
+        "1,80,12\n"
+        "2,90,15\n"
+        "3,70,18\n",
+        encoding="utf-8",
+    )
 
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "analyze_csv",
+        {
+            "path": "results.csv",
+        },
+    )
+
+    assert result.ok is True
+    assert result.data is not None
+
+    assert result.data["row_count"] == 3
+
+    assert result.data["columns"] == [
+        "experiment_id",
+        "throughput_mbps",
+        "latency_ms",
+    ]
+
+    throughput = result.data[
+        "numeric_summary"
+    ]["throughput_mbps"]
+
+    assert throughput["count"] == 3
+    assert throughput["min"] == 70.0
+    assert throughput["max"] == 90.0
+    assert throughput["mean"] == pytest.approx(
+        80.0
+    )
+
+def test_analyze_csv_tracks_missing_values(
+    tmp_path,
+) -> None:
+    """应统计缺失值，并避免把文本列当成数值列。"""
+
+    (
+        tmp_path / "results.csv"
+    ).write_text(
+        "name,score,status\n"
+        "run_a,90,ok\n"
+        "run_b,,failed\n"
+        "run_c,80,ok\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "analyze_csv",
+        {
+            "path": "results.csv",
+        },
+    )
+
+    assert result.ok is True
+
+    assert result.data[
+        "missing_values"
+    ]["score"] == 1
+
+    assert "score" in result.data[
+        "numeric_summary"
+    ]
+
+    assert "name" not in result.data[
+        "numeric_summary"
+    ]
+
+    assert "status" not in result.data[
+        "numeric_summary"
+    ]
+
+def test_analyze_csv_tracks_missing_values(
+    tmp_path,
+) -> None:
+    """应统计缺失值，并避免把文本列当成数值列。"""
+
+    (
+        tmp_path / "results.csv"
+    ).write_text(
+        "name,score,status\n"
+        "run_a,90,ok\n"
+        "run_b,,failed\n"
+        "run_c,80,ok\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "analyze_csv",
+        {
+            "path": "results.csv",
+        },
+    )
+
+    assert result.ok is True
+
+    assert result.data[
+        "missing_values"
+    ]["score"] == 1
+
+    assert "score" in result.data[
+        "numeric_summary"
+    ]
+
+    assert "name" not in result.data[
+        "numeric_summary"
+    ]
+
+    assert "status" not in result.data[
+        "numeric_summary"
+    ]
+
+def test_analyze_csv_rejects_outside_path(
+    tmp_path,
+) -> None:
+    """不得通过路径逃出 workspace。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    outside_file = tmp_path / "secret.csv"
+
+    outside_file.write_text(
+        "value\n123\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        workspace
+    )
+
+    result = registry.execute(
+        "analyze_csv",
+        {
+            "path": "../secret.csv",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert "workspace 之外" in result.error
+
+def test_analyze_csv_respects_max_rows(
+    tmp_path,
+) -> None:
+    """超过 max_rows 后应停止分析并标记 truncated。"""
+
+    (
+        tmp_path / "results.csv"
+    ).write_text(
+        "value\n"
+        "1\n"
+        "2\n"
+        "3\n"
+        "4\n",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "analyze_csv",
+        {
+            "path": "results.csv",
+            "max_rows": 2,
+        },
+    )
+
+    assert result.ok is True
+    assert result.data["row_count"] == 2
+    assert result.data["truncated"] is True
+
+    summary = result.data[
+        "numeric_summary"
+    ]["value"]
+
+    assert summary["mean"] == pytest.approx(
+        1.5
+    )
+
+def test_analyze_csv_rejects_non_csv(
+    tmp_path,
+) -> None:
+    """analyze_csv 不应读取其他文件类型。"""
+
+    (
+        tmp_path / "notes.txt"
+    ).write_text(
+        "hello",
+        encoding="utf-8",
+    )
+
+    registry = build_default_registry(
+        tmp_path
+    )
+
+    result = registry.execute(
+        "analyze_csv",
+        {
+            "path": "notes.txt",
+        },
+    )
+
+    assert result.ok is False
+    assert result.data is None
+    assert ".csv" in result.error
