@@ -15,6 +15,7 @@ from reliable_task_agent.tools.registry import (
     RegisteredTool,
     ToolExecutionResult,
 )
+from reliable_task_agent.telemetry import NOOP_TELEMETRY, Telemetry
 
 
 EffectState = Literal[
@@ -418,10 +419,70 @@ FaultHook = Callable[[str], None]
 class EffectExecutor:
     """执行受保护副作用，并根据 Ledger 状态安全恢复。"""
 
-    def __init__(self, store: EffectStore) -> None:
+    def __init__(
+        self,
+        store: EffectStore,
+        *,
+        telemetry: Telemetry | None = None,
+    ) -> None:
         self.store = store
+        self.telemetry = telemetry or NOOP_TELEMETRY
 
     def execute(
+        self,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+        transition_hook: TransitionHook,
+        fault_hook: FaultHook,
+    ) -> ToolExecutionResult:
+        effect_id, _ = build_effect_identity(run_id, tool_call_id)
+        with self.telemetry.span(
+            "rta.effect",
+            {
+                "rta.run.id": run_id,
+                "rta.tool.name": tool.name,
+                "rta.tool_call.id": tool_call_id,
+                "rta.effect.id": effect_id,
+            },
+            error_category="effect_boundary",
+        ) as effect_span:
+
+            def observed_transition(details: dict[str, Any]) -> None:
+                attributes = {
+                    "rta.effect.id": details.get("effect_id"),
+                    "rta.effect.from_state": details.get("from_state"),
+                    "rta.effect.to_state": details.get("to_state"),
+                    "rta.reconciliation.outcome": details.get(
+                        "reconciliation_status"
+                    ),
+                }
+                effect_span.add_event(
+                    "rta.effect.transition",
+                    attributes,
+                )
+                effect_span.set_attribute(
+                    "rta.effect.state",
+                    details.get("to_state"),
+                )
+                effect_span.set_attribute(
+                    "rta.reconciliation.outcome",
+                    details.get("reconciliation_status"),
+                )
+                transition_hook(details)
+
+            return self._execute_unobserved(
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                tool=tool,
+                arguments=arguments,
+                transition_hook=observed_transition,
+                fault_hook=fault_hook,
+            )
+
+    def _execute_unobserved(
         self,
         *,
         run_id: str,
@@ -520,28 +581,46 @@ class EffectExecutor:
             )
 
         if not created:
-            try:
-                reconciliation = tool.effect_spec.reconcile(
-                    validated_args,
-                    idempotency_key,
-                )
-                reconciliation = (
-                    reconciliation
-                    if isinstance(
-                        reconciliation,
-                        ReconciliationResult,
+            with self.telemetry.span(
+                "rta.reconciliation",
+                {
+                    "rta.run.id": run_id,
+                    "rta.tool.name": tool.name,
+                    "rta.tool_call.id": tool_call_id,
+                    "rta.effect.id": effect_id,
+                },
+                error_category="reconciliation",
+            ) as reconciliation_span:
+                try:
+                    reconciliation = tool.effect_spec.reconcile(
+                        validated_args,
+                        idempotency_key,
                     )
-                    else ReconciliationResult.model_validate(
+                    reconciliation = (
                         reconciliation
+                        if isinstance(
+                            reconciliation,
+                            ReconciliationResult,
+                        )
+                        else ReconciliationResult.model_validate(
+                            reconciliation
+                        )
                     )
-                )
-            except Exception as exc:
-                reconciliation = ReconciliationResult(
-                    status="UNKNOWN",
-                    reason=(
-                        "Reconciliation raised "
-                        f"{type(exc).__name__}: {exc}"
-                    ),
+                except Exception as exc:
+                    reconciliation_span.record_error(
+                        exc,
+                        category="reconciliation",
+                    )
+                    reconciliation = ReconciliationResult(
+                        status="UNKNOWN",
+                        reason=(
+                            "Reconciliation raised "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    )
+                reconciliation_span.set_attribute(
+                    "rta.reconciliation.outcome",
+                    reconciliation.status,
                 )
 
             if reconciliation.status == "FOUND":
