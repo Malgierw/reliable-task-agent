@@ -25,6 +25,9 @@ server = MCPServer(
 def get_ticket(ticket_id: str) -> dict[str, Any]:
     """Return a deterministic demo ticket."""
 
+    if ticket_id == "raise-error":
+        raise ValueError("demo ticket lookup failed")
+
     return {
         "ticket_id": ticket_id,
         "status": "open",

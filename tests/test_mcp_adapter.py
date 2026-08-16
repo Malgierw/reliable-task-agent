@@ -8,8 +8,10 @@ import pytest
 
 from reliable_task_agent.mcp_adapter import (
     MCPDiscoveryError,
+    MCPInvocationError,
     MCPStdioServer,
     discover_stdio_tools,
+    invoke_stdio_tool,
 )
 
 
@@ -20,14 +22,18 @@ DEMO_SERVER = (
 )
 
 
+def demo_server() -> MCPStdioServer:
+    return MCPStdioServer(
+        command=sys.executable,
+        args=(str(DEMO_SERVER),),
+        cwd=DEMO_SERVER.parent,
+    )
+
+
 def discover_demo_tools():
     return asyncio.run(
         discover_stdio_tools(
-            MCPStdioServer(
-                command=sys.executable,
-                args=(str(DEMO_SERVER),),
-                cwd=DEMO_SERVER.parent,
-            )
+            demo_server()
         )
     )
 
@@ -92,3 +98,75 @@ def test_discovery_failure_has_adapter_level_error() -> None:
         match="MCP tool discovery failed for stdio server",
     ):
         asyncio.run(discover_stdio_tools(server))
+
+
+def test_invokes_get_ticket_and_maps_mcp_result() -> None:
+    result = asyncio.run(
+        invoke_stdio_tool(
+            demo_server(),
+            tool_name="get_ticket",
+            arguments={"ticket_id": "ticket-417"},
+            ordinary_tool_names={"get_ticket"},
+        )
+    )
+
+    assert result.ok is True
+    assert result.tool_name == "get_ticket"
+    assert result.error is None
+    assert result.data["isError"] is False
+    assert result.data["structuredContent"] == {
+        "ticket_id": "ticket-417",
+        "status": "open",
+    }
+    assert result.data["content"]
+
+
+def test_maps_mcp_tool_error_without_transport_failure() -> None:
+    result = asyncio.run(
+        invoke_stdio_tool(
+            demo_server(),
+            tool_name="get_ticket",
+            arguments={"ticket_id": "raise-error"},
+            ordinary_tool_names={"get_ticket"},
+        )
+    )
+
+    assert result.ok is False
+    assert result.tool_name == "get_ticket"
+    assert result.data["isError"] is True
+    assert "demo ticket lookup failed" in result.error
+
+
+def test_invocation_transport_failure_has_adapter_level_error() -> None:
+    server = MCPStdioServer(
+        command=sys.executable,
+        args=("-c", "raise SystemExit(24)"),
+    )
+
+    with pytest.raises(
+        MCPInvocationError,
+        match="MCP tool invocation failed for stdio server",
+    ):
+        asyncio.run(
+            invoke_stdio_tool(
+                server,
+                tool_name="get_ticket",
+                arguments={"ticket_id": "ticket-1"},
+                ordinary_tool_names={"get_ticket"},
+            )
+        )
+
+
+def test_create_ticket_is_not_exposed_as_an_ordinary_tool() -> None:
+    result = asyncio.run(
+        invoke_stdio_tool(
+            MCPStdioServer(command="must-not-be-launched"),
+            tool_name="create_ticket",
+            arguments={"title": "A", "description": "B"},
+            ordinary_tool_names={"get_ticket"},
+        )
+    )
+
+    assert result.ok is False
+    assert result.tool_name == "create_ticket"
+    assert "not explicitly approved" in result.error
