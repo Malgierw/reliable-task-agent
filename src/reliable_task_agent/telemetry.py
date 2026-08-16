@@ -3,7 +3,14 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
+from urllib.parse import urlsplit
 
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+    OTLPSpanExporter,
+)
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import Tracer
 
 
@@ -47,6 +54,8 @@ _ATTRIBUTE_KEYS = frozenset(
 
 _EVENT_NAMES = frozenset({"rta.effect.transition"})
 _MAX_STRING_LENGTH = 256
+_SERVICE_NAME = "reliable-task-agent"
+_SAFE_EXPORT_HEADERS = {"User-Agent": _SERVICE_NAME}
 
 
 def _safe_value(value: Any) -> bool | int | float | str | None:
@@ -112,8 +121,14 @@ class TelemetrySpan:
 class Telemetry:
     """Optional manual tracing facade that can never affect RTA execution."""
 
-    def __init__(self, tracer: Tracer | None = None) -> None:
+    def __init__(
+        self,
+        tracer: Tracer | None = None,
+        *,
+        tracer_provider: Any | None = None,
+    ) -> None:
         self._tracer = tracer
+        self._tracer_provider = tracer_provider
 
     @classmethod
     def from_tracer_provider(
@@ -127,6 +142,71 @@ class Telemetry:
         except Exception:
             tracer = None
         return cls(tracer)
+
+    @classmethod
+    def from_otlp_http(
+        cls,
+        endpoint: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> Telemetry:
+        """Build opt-in OTLP/HTTP tracing without changing global state.
+
+        Configuration failures fail open to a disabled Telemetry instance.
+        Credentials in endpoint URLs are rejected, and environment-provided
+        OTLP headers are deliberately not inherited.
+        """
+
+        try:
+            parsed = urlsplit(endpoint)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or timeout_seconds <= 0
+            ):
+                return cls()
+
+            resource = Resource({SERVICE_NAME: _SERVICE_NAME})
+            provider = TracerProvider(
+                resource=resource,
+                shutdown_on_exit=False,
+            )
+            exporter = OTLPSpanExporter(
+                endpoint=endpoint,
+                headers=_SAFE_EXPORT_HEADERS,
+                timeout=timeout_seconds,
+            )
+            provider.add_span_processor(BatchSpanProcessor(exporter))
+            tracer = provider.get_tracer("reliable_task_agent")
+            return cls(tracer, tracer_provider=provider)
+        except Exception:
+            return cls()
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        """Request delivery for tests/shutdown without affecting execution."""
+
+        if self._tracer_provider is None:
+            return True
+        try:
+            return bool(
+                self._tracer_provider.force_flush(
+                    timeout_millis=timeout_millis
+                )
+            )
+        except Exception:
+            return False
+
+    def shutdown(self) -> None:
+        """Best-effort exporter shutdown; delivery errors remain isolated."""
+
+        if self._tracer_provider is None:
+            return
+        try:
+            self._tracer_provider.shutdown()
+        except Exception:
+            pass
 
     @contextmanager
     def span(
