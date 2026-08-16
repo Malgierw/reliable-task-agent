@@ -6,7 +6,7 @@ Reliable Task Agent is a compact Python runtime for tool-using agents that need 
 >
 > **Checkpoint absence != proof that an external effect did not happen.**
 
-**Checkpoint/Resume · Verifier-driven Repair · Effect Boundary · Fault Benchmark**
+**Checkpoint/Resume · Verifier-driven Repair · Effect Boundary · MCP · OpenTelemetry · Fault Benchmark**
 
 ## Why this project exists
 
@@ -26,6 +26,8 @@ Reliable Task Agent treats model output as a proposal, verifies important result
 - **Durable execution:** persistent traces, checkpoints, resume by `run_id`, pending-call recovery, and reuse of completed Tool Call results.
 - **Verifier-driven Repair:** structured verification errors, runtime hard feedback, bounded repair attempts, and crash/resume-safe repair bookkeeping.
 - **Effect Boundary:** durable effect identity, receipts, reconciliation, and fail-closed handling for explicitly registered side-effecting tools.
+- **MCP Tool Adapter:** official MCP SDK integration for local stdio discovery, schema mapping, ordinary invocation, and explicitly policy-managed MCP effects.
+- **Optional OpenTelemetry:** fail-open manual spans with optional OTLP/HTTP protobuf export; telemetry delivery is never part of runtime correctness.
 - **Safety and testing:** workspace-scoped file tools, path-traversal protection, deterministic verification, and failure-injection hooks.
 
 ## Architecture
@@ -41,9 +43,14 @@ flowchart TD
     V -->|"FAIL: structured hard feedback"| A
     V -->|"PASS"| S["SUCCESS"]
     R --> E["Effect Executor"]
+    R --> M["MCP Tool Adapter"]
+    M --> MS["Local stdio MCP server"]
+    M -->|"explicit effect policy"| E
     E --> L["Durable Effect Ledger"]
     E --> B["External business system"]
     L -->|"PREPARED: reconcile"| B
+    A -.-> OT["Optional OpenTelemetry spans"]
+    OT -.-> OTL["OTLP/HTTP trace receiver"]
 ```
 
 Ordinary tools remain compatible with the Tool Registry. Effect-managed tools must be registered explicitly and can execute only through the Effect Executor.
@@ -96,6 +103,62 @@ A successful execution stores the complete serialized `ToolExecutionResult` rece
 - `UNKNOWN`, including reconciliation errors, is persisted and fails closed.
 
 `COMMITTED` and `UNKNOWN` are terminal for automatic recovery. The included SQLite `create_ticket` workload demonstrates **duplicate-safe recovery for explicitly registered, idempotent/reconcilable side effects under the implemented and tested SQLite semantics.**
+
+## MCP Tool Adapter
+
+The MCP adapter uses the official Model Context Protocol Python SDK. It supports local stdio servers, `tools/list` discovery, JSON input-schema mapping, annotations/metadata preservation, and `tools/call` invocation for explicitly allowlisted ordinary tools.
+
+MCP annotations are retained only as untrusted metadata. They never classify a tool as safe or effect-managed. A side-effecting MCP tool such as `create_ticket` must be selected by explicit local RTA policy and registered through the existing Effect Boundary:
+
+```text
+MCP create_ticket
+-> explicit RTA effect policy
+-> PREPARED
+-> MCP tools/call
+-> business commit
+-> COMMITTED
+-> Agent checkpoint
+```
+
+Recovery reuses the same Effect Ledger and reconciliation rules as non-MCP effects; there is no second MCP-specific state machine. The ordinary MCP invocation path denies `create_ticket`, preventing it from bypassing the Effect Boundary.
+
+A real configured-model smoke validation used `deepseek-v4-flash` to select MCP `create_ticket`, pass through `PREPARED -> COMMITTED`, create exactly one ticket, persist a completed Agent checkpoint, and return `SUCCESS`. This is evidence for that executed integration path, not a general guarantee about all models, servers, or external systems.
+
+## OpenTelemetry and agent-replay
+
+Manual tracing is optional and defaults to no-op. When configured, RTA emits namespaced spans for the principal boundaries, including `rta.agent.run`, `rta.llm.call`, `rta.tool.execute`, `rta.mcp.call`, `rta.effect`, `rta.reconciliation`, `rta.verifier`, and `rta.repair`.
+
+`Telemetry.from_otlp_http(...)` configures the official OTLP HTTP/protobuf exporter with `service.name=reliable-task-agent`:
+
+```python
+telemetry = Telemetry.from_otlp_http(
+    "http://127.0.0.1:4318/v1/traces"
+)
+agent = AgentLoop(..., telemetry=telemetry)
+```
+
+Only allowlisted identifiers and state attributes are exported. Prompts, complete model responses, raw tool arguments/results, credentials, headers, `.env` contents, and arbitrary exception strings are excluded. Exporter setup, delivery, flush, and shutdown failures remain isolated from Agent, checkpoint, verifier, and Effect Boundary semantics.
+
+The deterministic [agent-replay interoperability demo](examples/otel_agent_replay_demo.py) requires no real model call. With the external `clay-good/agent-replay` CLI listening on port 4318, the validated path was:
+
+```text
+RTA deterministic AgentLoop
+-> OTLP/HTTP protobuf
+-> agent-replay receiver
+-> local agent-replay SQLite trace store
+```
+
+The validation ingested a completed five-step trace and preserved this hierarchy:
+
+```text
+rta.agent.run
+├── rta.llm.call
+├── rta.tool.execute
+│   └── rta.effect
+└── rta.llm.call
+```
+
+`agent-replay list`, `show --json`, `show --tree`, and `replay --speed 0` all succeeded. This is **OTLP interoperability, not native agent-replay GenAI semantic mapping**: because RTA uses its own span names rather than recognized GenAI root conventions, agent-replay groups the spans into a synthetic trace using the OpenTelemetry trace ID. Node.js and agent-replay remain external demo prerequisites and are not RTA runtime dependencies.
 
 ## Reliability benchmark
 
@@ -190,10 +253,10 @@ uv run --group benchmark pytest -q
 Current complete suite:
 
 ```text
-92 passed
+113 passed
 ```
 
-Tests cover tool validation, workspace boundaries, retries, traces, checkpoints, resume, completed-result reuse, verifier-driven repair, repair crash windows, Effect Ledger transitions, reconciliation, fail-closed UNKNOWN behavior, real SQLite fault injection, and the cross-runtime benchmark harness.
+Tests cover tool validation, workspace boundaries, retries, traces, checkpoints, resume, completed-result reuse, verifier-driven repair, repair crash windows, Effect Ledger transitions, reconciliation, fail-closed UNKNOWN behavior, MCP discovery/invocation/effect recovery, OpenTelemetry/OTLP export, real SQLite fault injection, and the cross-runtime benchmark harness.
 
 ## Limitations and non-goals
 
@@ -203,6 +266,9 @@ Tests cover tool validation, workspace boundaries, retries, traces, checkpoints,
 - `UNKNOWN` intentionally requires operator or application-level resolution.
 - Verifier-driven repair is bounded and task-specific; a successful smoke test is not a general self-healing guarantee.
 - Deterministic verification is only as complete as the verifier's encoded rules.
+- MCP support is currently scoped to explicitly configured local stdio servers; MCP annotations are not trusted safety policy.
+- OpenTelemetry is observability only. Export failure cannot establish or change task correctness, and the runtime does not include a Collector or backend.
+- agent-replay currently represents RTA-specific spans as an OTel-trace-ID-based synthetic trace rather than native GenAI semantic mapping.
 - The benchmark uses one deterministic ticket workload, local SQLite, a scripted model client, one Windows host, and pinned dependency versions.
 - F3 compares analogous, not identical, internal durability boundaries.
 - The benchmark does not measure latency, throughput, concurrency, network partitions, or distributed databases.
@@ -212,4 +278,4 @@ Tests cover tool validation, workspace boundaries, retries, traces, checkpoints,
 
 Reliable Task Agent is an engineering reference implementation for making selected agent workflows more observable, verifiable, and recoverable. It favors explicit contracts—validated tools, deterministic verifiers, bounded repair, durable effect state, and fail-closed ambiguity—over broad claims about autonomous correctness.
 
-The repository contains the runtime under `src/reliable_task_agent/`, deterministic tests under `tests/`, the demo inputs under `demo_workspace/`, and the benchmark plus compact evidence under `benchmarks/`.
+The repository contains the runtime under `src/reliable_task_agent/`, deterministic tests under `tests/`, runnable integration demos under `examples/`, the analysis inputs under `demo_workspace/`, and the benchmark plus compact evidence under `benchmarks/`.
