@@ -7,7 +7,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from reliable_task_agent.tools.registry import ToolRegistry
+from reliable_task_agent.tools.registry import (
+    SafeToolFeedbackError,
+    ToolRegistry,
+)
 
 
 class ShannonCapacityArgs(BaseModel):
@@ -77,7 +80,8 @@ def read_text_file(
             workspace
         )
     except ValueError as exc:
-        raise PermissionError(
+        raise SafeToolFeedbackError(
+            "workspace_violation",
             "禁止读取工作区之外的文件。"
         ) from exc
 
@@ -136,7 +140,8 @@ def list_workspace_files(
     try:
         target.relative_to(workspace)
     except ValueError as exc:
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "workspace_violation",
             "不允许访问 workspace 之外的路径。"
         ) from exc
 
@@ -220,7 +225,8 @@ def search_text(
     try:
         target.relative_to(workspace)
     except ValueError as exc:
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "workspace_violation",
             "不允许访问 workspace 之外的路径。"
         ) from exc
 
@@ -342,7 +348,8 @@ def analyze_csv(
             workspace
         )
     except ValueError as exc:
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "workspace_violation",
             "不允许访问 workspace 之外的路径。"
         ) from exc
 
@@ -357,7 +364,8 @@ def analyze_csv(
         )
 
     if file_path.suffix.lower() != ".csv":
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "invalid_file_type",
             "analyze_csv 只允许分析 .csv 文件。"
         )
 
@@ -535,17 +543,20 @@ def write_analysis_report(
             workspace
         )
     except ValueError as exc:
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "workspace_violation",
             "不允许在 workspace 之外写入文件。"
         ) from exc
 
     if report_path.suffix.lower() != ".md":
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "invalid_output_type",
             "分析报告必须是 .md 文件。"
         )
 
     if report_path.exists() and not args.overwrite:
-        raise FileExistsError(
+        raise SafeToolFeedbackError(
+            "file_already_exists",
             f"报告已经存在：{relative_path.as_posix()}"
         )
 
@@ -804,7 +815,8 @@ def verify_analysis_report(
         try:
             path.relative_to(workspace)
         except ValueError as exc:
-            raise ValueError(
+            raise SafeToolFeedbackError(
+                "workspace_violation",
                 "不允许访问 workspace 之外的路径。"
             ) from exc
 
@@ -826,7 +838,8 @@ def verify_analysis_report(
         )
 
     if report_path.suffix.lower() != ".md":
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "invalid_file_type",
             "待验证报告必须是 .md 文件。"
         )
 
@@ -841,7 +854,8 @@ def verify_analysis_report(
         )
 
     if results_path.suffix.lower() != ".csv":
-        raise ValueError(
+        raise SafeToolFeedbackError(
+            "invalid_file_type",
             "实验结果必须是 .csv 文件。"
         )
 

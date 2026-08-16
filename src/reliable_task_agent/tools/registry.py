@@ -5,6 +5,10 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
 
+from reliable_task_agent.durable_errors import (
+    durable_error_message,
+    durable_validation_error_message,
+)
 
 # 规定工具执行函数的形式：
 # 接收一个经过 Pydantic 校验的参数对象，返回任意类型结果。
@@ -50,6 +54,14 @@ class ToolExecutionResult(BaseModel):
     tool_name: str
     data: Any | None = None
     error: str | None = None
+
+
+class SafeToolFeedbackError(RuntimeError):
+    """A built-in failure with a static, persistence-safe diagnostic code."""
+
+    def __init__(self, error_category: str, message: str) -> None:
+        super().__init__(message)
+        self.error_category = error_category
 
 
 class ToolRegistry:
@@ -132,7 +144,10 @@ class ToolRegistry:
             return ToolExecutionResult(
                 ok=False,
                 tool_name=name,
-                error=str(exc),
+                error=durable_error_message(
+                    exc,
+                    category="tool_lookup",
+                ),
             )
 
         if tool.effect_spec is not None:
@@ -161,14 +176,30 @@ class ToolRegistry:
             return ToolExecutionResult(
                 ok=False,
                 tool_name=name,
-                error=f"工具参数校验失败：{exc}",
+                error=durable_validation_error_message(
+                    exc,
+                    category="tool_argument_validation",
+                ),
+            )
+
+        except SafeToolFeedbackError as exc:
+            return ToolExecutionResult(
+                ok=False,
+                tool_name=name,
+                error=durable_error_message(
+                    exc,
+                    category=exc.error_category,
+                ),
             )
 
         except Exception as exc:
             return ToolExecutionResult(
                 ok=False,
                 tool_name=name,
-                error=f"{type(exc).__name__}: {exc}",
+                error=durable_error_message(
+                    exc,
+                    category="tool_execution",
+                ),
             )
 
         return ToolExecutionResult(

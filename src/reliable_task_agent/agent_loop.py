@@ -25,6 +25,11 @@ from reliable_task_agent.effects import (
     EffectSafetyError,
     EffectStore,
 )
+from reliable_task_agent.durable_errors import (
+    durable_error_details,
+    durable_error_message,
+)
+from reliable_task_agent.telemetry import NOOP_TELEMETRY, Telemetry
 
 
 
@@ -86,6 +91,7 @@ class AgentLoop:
         checkpoint_store: CheckpointStore | None = None,
         effect_store: EffectStore | None = None,
         fault_hook: Callable[[str], None] | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         
         if client is None and model is None:
@@ -123,8 +129,9 @@ class AgentLoop:
         self.sleep_fn = sleep_fn
         self.trace_store = trace_store
         self.checkpoint_store = checkpoint_store
+        self.telemetry = telemetry or NOOP_TELEMETRY
         self.effect_executor = (
-            EffectExecutor(effect_store)
+            EffectExecutor(effect_store, telemetry=self.telemetry)
             if effect_store is not None
             else None
         )
@@ -206,6 +213,39 @@ class AgentLoop:
     ) -> Any:
         """通过普通路径或受保护 Effect Boundary 执行工具。"""
 
+        with self.telemetry.span(
+            "rta.tool.execute",
+            {
+                "rta.run.id": checkpoint.run_id,
+                "rta.step": step,
+                "rta.tool.name": tool_name,
+                "rta.tool_call.id": tool_call_id,
+            },
+            error_category="tool_execution",
+        ) as telemetry_span:
+            result = self._execute_tool_call_unobserved(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                checkpoint=checkpoint,
+                trace=trace,
+                step=step,
+            )
+            telemetry_span.set_attribute("rta.tool.ok", result.ok)
+            return result
+
+    def _execute_tool_call_unobserved(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        checkpoint: AgentCheckpoint,
+        trace: RunTrace,
+        step: int,
+    ) -> Any:
+        """Execute a tool while the public wrapper owns observability."""
+
         try:
             tool = self.registry.get(tool_name)
         except KeyError:
@@ -225,7 +265,12 @@ class AgentLoop:
                 "Effect-managed 工具缺少 EffectStore 配置："
                 f"{tool_name}"
             )
-            checkpoint.mark_failed(str(error))
+            checkpoint.mark_failed(
+                durable_error_message(
+                    error,
+                    category="effect_configuration",
+                )
+            )
             self._persist_checkpoint(checkpoint)
             self._record_event(
                 trace=trace,
@@ -235,7 +280,10 @@ class AgentLoop:
                     "stage": "effect_boundary",
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
-                    "message": str(error),
+                    **durable_error_details(
+                        error,
+                        category="effect_configuration",
+                    ),
                 },
             )
             raise error
@@ -255,7 +303,12 @@ class AgentLoop:
                 fault_hook=self._maybe_inject_fault,
             )
         except Exception as exc:
-            checkpoint.mark_failed(str(exc))
+            checkpoint.mark_failed(
+                durable_error_message(
+                    exc,
+                    category="effect_boundary",
+                )
+            )
             self._persist_checkpoint(checkpoint)
             self._record_event(
                 trace=trace,
@@ -265,8 +318,10 @@ class AgentLoop:
                     "stage": "effect_boundary",
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
+                    **durable_error_details(
+                        exc,
+                        category="effect_boundary",
+                    ),
                 },
             )
             raise
@@ -287,6 +342,55 @@ class AgentLoop:
         repair_count 统计已经向模型请求的修复周期。达到上限后，
         下一次验证失败会终止运行，而不会再请求新的修复周期。
         """
+
+        if tool_name != "verify_analysis_report":
+            return
+
+        data = result_data.get("data")
+        verifier_passed = (
+            data.get("verification_passed")
+            if result_data.get("ok") is True
+            and isinstance(data, dict)
+            and isinstance(data.get("verification_passed"), bool)
+            else None
+        )
+        attributes: dict[str, Any] = {
+            "rta.run.id": checkpoint.run_id,
+            "rta.step": step,
+            "rta.tool.name": tool_name,
+            "rta.tool_call.id": tool_call_id,
+            "rta.repair.count": checkpoint.repair_count,
+        }
+        if verifier_passed is not None:
+            attributes["rta.verifier.passed"] = verifier_passed
+
+        with self.telemetry.span(
+            "rta.verifier",
+            attributes,
+            error_category="verification",
+        ):
+            self._handle_verification_result_unobserved(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                result_data=result_data,
+                messages=messages,
+                checkpoint=checkpoint,
+                trace=trace,
+                step=step,
+            )
+
+    def _handle_verification_result_unobserved(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        result_data: dict[str, Any],
+        messages: list[dict[str, Any]],
+        checkpoint: AgentCheckpoint,
+        trace: RunTrace,
+        step: int,
+    ) -> None:
+        """Apply verifier repair semantics without changing their ordering."""
 
         if (
             tool_call_id
@@ -328,6 +432,18 @@ class AgentLoop:
         )
 
         if checkpoint.repair_count >= self.max_repair_attempts:
+            with self.telemetry.span(
+                "rta.repair",
+                {
+                    "rta.run.id": checkpoint.run_id,
+                    "rta.step": step,
+                    "rta.tool_call.id": tool_call_id,
+                    "rta.repair.count": checkpoint.repair_count,
+                    "rta.repair.max_attempts": self.max_repair_attempts,
+                },
+                error_category="repair_exhausted",
+            ):
+                pass
             error_message = (
                 "确定性验证持续失败，已用尽 "
                 f"{self.max_repair_attempts} 次修复机会。"
@@ -354,6 +470,18 @@ class AgentLoop:
 
         checkpoint.repair_count += 1
         repair_attempt = checkpoint.repair_count
+        with self.telemetry.span(
+            "rta.repair",
+            {
+                "rta.run.id": checkpoint.run_id,
+                "rta.step": step,
+                "rta.tool_call.id": tool_call_id,
+                "rta.repair.count": repair_attempt,
+                "rta.repair.max_attempts": self.max_repair_attempts,
+            },
+            error_category="repair",
+        ):
+            pass
         checkpoint.handled_verification_tool_call_ids.add(
             tool_call_id
         )
@@ -411,12 +539,22 @@ class AgentLoop:
 
         for attempt in range(1, total_attempts + 1):
             try:
-                return self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=self.registry.to_openai_tools(),
-                    tool_choice="auto",
-                )
+                with self.telemetry.span(
+                    "rta.llm.call",
+                    {
+                        "rta.run.id": checkpoint.run_id,
+                        "rta.step": step,
+                        "rta.attempt": attempt,
+                        "rta.model.name": self.model,
+                    },
+                    error_category="model_request",
+                ):
+                    return self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        tools=self.registry.to_openai_tools(),
+                        tool_choice="auto",
+                    )
 
             except Exception as exc:
                 retryable = is_retryable_model_error(exc)
@@ -432,17 +570,19 @@ class AgentLoop:
                             "attempt": attempt,
                             "max_attempts": total_attempts,
                             "retryable": retryable,
-                            "error_type": type(exc).__name__,
-                            "status_code": getattr(
+                            **durable_error_details(
                                 exc,
-                                "status_code",
-                                None,
+                                category="model_request",
                             ),
-                            "message": str(exc),
                         },
                     )
                     
-                    checkpoint.mark_failed(str(exc))
+                    checkpoint.mark_failed(
+                        durable_error_message(
+                            exc,
+                            category="model_request",
+                        )
+                    )
                     self._persist_checkpoint(checkpoint)
                     
                     raise
@@ -460,13 +600,10 @@ class AgentLoop:
                         "attempt": attempt,
                         "next_attempt": attempt + 1,
                         "delay_seconds": delay,
-                        "error_type": type(exc).__name__,
-                        "status_code": getattr(
+                        **durable_error_details(
                             exc,
-                            "status_code",
-                            None,
+                            category="model_request",
                         ),
-                        "message": str(exc),
                     },
                 )
 
@@ -513,12 +650,27 @@ class AgentLoop:
         self.last_checkpoint = checkpoint
         self._persist_checkpoint(checkpoint)
 
-        return self._continue_run(
-            messages=messages,
-            trace=trace,
-            checkpoint=checkpoint,
-            start_step=1,
-        )
+        with self.telemetry.span(
+            "rta.agent.run",
+            {
+                "rta.run.id": checkpoint.run_id,
+                "rta.agent.resumed": False,
+                "rta.model.name": self.model,
+            },
+            error_category="agent_run",
+        ) as telemetry_span:
+            try:
+                answer = self._continue_run(
+                    messages=messages,
+                    trace=trace,
+                    checkpoint=checkpoint,
+                    start_step=1,
+                )
+            except BaseException:
+                telemetry_span.set_attribute("rta.agent.outcome", "failed")
+                raise
+            telemetry_span.set_attribute("rta.agent.outcome", "completed")
+            return answer
 
     def _load_or_create_trace(
         self,
@@ -636,7 +788,10 @@ class AgentLoop:
                         "ok": False,
                         "tool_name": tool_name,
                         "data": None,
-                        "error": f"工具参数解析失败：{exc}",
+                        "error": durable_error_message(
+                            exc,
+                            category="tool_argument_json",
+                        ),
                     }
                     result_data = failure_data
 
@@ -920,8 +1075,9 @@ class AgentLoop:
                         "ok": False,
                         "tool_name": tool_name,
                         "data": None,
-                        "error": (
-                            f"工具参数解析失败：{exc}"
+                        "error": durable_error_message(
+                            exc,
+                            category="tool_argument_json",
                         ),
                     }
 
@@ -1062,6 +1218,34 @@ class AgentLoop:
         trace = self._load_or_create_trace(run_id)
         self.last_trace = trace
         self._persist_trace(trace)
+
+        with self.telemetry.span(
+            "rta.agent.run",
+            {
+                "rta.run.id": checkpoint.run_id,
+                "rta.agent.resumed": True,
+                "rta.model.name": self.model,
+            },
+            error_category="agent_resume",
+        ) as telemetry_span:
+            try:
+                answer = self._resume_checkpoint(
+                    checkpoint=checkpoint,
+                    trace=trace,
+                )
+            except BaseException:
+                telemetry_span.set_attribute("rta.agent.outcome", "failed")
+                raise
+            telemetry_span.set_attribute("rta.agent.outcome", "completed")
+            return answer
+
+    def _resume_checkpoint(
+        self,
+        *,
+        checkpoint: AgentCheckpoint,
+        trace: RunTrace,
+    ) -> str:
+        """Resume within the root telemetry span."""
 
         # 已完成任务不需要再次请求模型
         if checkpoint.status == "completed":

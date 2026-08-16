@@ -11,10 +11,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError
 
+from reliable_task_agent.durable_errors import (
+    durable_error_message,
+    durable_validation_error_message,
+    normalize_durable_error_message,
+)
 from reliable_task_agent.tools.registry import (
     RegisteredTool,
     ToolExecutionResult,
 )
+from reliable_task_agent.telemetry import NOOP_TELEMETRY, Telemetry
 
 
 EffectState = Literal[
@@ -382,6 +388,10 @@ class EffectStore:
         """把 PREPARED 原子转换为 UNKNOWN。"""
 
         now = utc_now().isoformat()
+        safe_reason = normalize_durable_error_message(
+            reason,
+            fallback_category="effect_unknown",
+        )
 
         with self._connect() as connection:
             connection.execute(
@@ -392,7 +402,7 @@ class EffectStore:
                     updated_at = ?
                 WHERE effect_id = ? AND state = 'PREPARED'
                 """,
-                (reason, now, effect_id),
+                (safe_reason, now, effect_id),
             )
             row = connection.execute(
                 "SELECT * FROM effects WHERE effect_id = ?",
@@ -418,10 +428,70 @@ FaultHook = Callable[[str], None]
 class EffectExecutor:
     """执行受保护副作用，并根据 Ledger 状态安全恢复。"""
 
-    def __init__(self, store: EffectStore) -> None:
+    def __init__(
+        self,
+        store: EffectStore,
+        *,
+        telemetry: Telemetry | None = None,
+    ) -> None:
         self.store = store
+        self.telemetry = telemetry or NOOP_TELEMETRY
 
     def execute(
+        self,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+        transition_hook: TransitionHook,
+        fault_hook: FaultHook,
+    ) -> ToolExecutionResult:
+        effect_id, _ = build_effect_identity(run_id, tool_call_id)
+        with self.telemetry.span(
+            "rta.effect",
+            {
+                "rta.run.id": run_id,
+                "rta.tool.name": tool.name,
+                "rta.tool_call.id": tool_call_id,
+                "rta.effect.id": effect_id,
+            },
+            error_category="effect_boundary",
+        ) as effect_span:
+
+            def observed_transition(details: dict[str, Any]) -> None:
+                attributes = {
+                    "rta.effect.id": details.get("effect_id"),
+                    "rta.effect.from_state": details.get("from_state"),
+                    "rta.effect.to_state": details.get("to_state"),
+                    "rta.reconciliation.outcome": details.get(
+                        "reconciliation_status"
+                    ),
+                }
+                effect_span.add_event(
+                    "rta.effect.transition",
+                    attributes,
+                )
+                effect_span.set_attribute(
+                    "rta.effect.state",
+                    details.get("to_state"),
+                )
+                effect_span.set_attribute(
+                    "rta.reconciliation.outcome",
+                    details.get("reconciliation_status"),
+                )
+                transition_hook(details)
+
+            return self._execute_unobserved(
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                tool=tool,
+                arguments=arguments,
+                transition_hook=observed_transition,
+                fault_hook=fault_hook,
+            )
+
+    def _execute_unobserved(
         self,
         *,
         run_id: str,
@@ -444,7 +514,10 @@ class EffectExecutor:
             return ToolExecutionResult(
                 ok=False,
                 tool_name=tool.name,
-                error=f"工具参数校验失败：{exc}",
+                error=durable_validation_error_message(
+                    exc,
+                    category="tool_argument_validation",
+                ),
             )
 
         arguments_hash = hash_arguments(validated_args)
@@ -519,29 +592,52 @@ class EffectExecutor:
                 or f"Effect 状态为 UNKNOWN：{effect_id}"
             )
 
+        reconciliation_exception_reason: str | None = None
         if not created:
-            try:
-                reconciliation = tool.effect_spec.reconcile(
-                    validated_args,
-                    idempotency_key,
-                )
-                reconciliation = (
-                    reconciliation
-                    if isinstance(
-                        reconciliation,
-                        ReconciliationResult,
+            with self.telemetry.span(
+                "rta.reconciliation",
+                {
+                    "rta.run.id": run_id,
+                    "rta.tool.name": tool.name,
+                    "rta.tool_call.id": tool_call_id,
+                    "rta.effect.id": effect_id,
+                },
+                error_category="reconciliation",
+            ) as reconciliation_span:
+                try:
+                    reconciliation = tool.effect_spec.reconcile(
+                        validated_args,
+                        idempotency_key,
                     )
-                    else ReconciliationResult.model_validate(
+                    reconciliation = (
                         reconciliation
+                        if isinstance(
+                            reconciliation,
+                            ReconciliationResult,
+                        )
+                        else ReconciliationResult.model_validate(
+                            reconciliation
+                        )
                     )
-                )
-            except Exception as exc:
-                reconciliation = ReconciliationResult(
-                    status="UNKNOWN",
-                    reason=(
-                        "Reconciliation raised "
-                        f"{type(exc).__name__}: {exc}"
-                    ),
+                except Exception as exc:
+                    reconciliation_span.record_error(
+                        exc,
+                        category="reconciliation",
+                    )
+                    reconciliation_exception_reason = durable_error_message(
+                        exc,
+                        category="reconciliation_exception",
+                    )
+                    reconciliation = ReconciliationResult(
+                        status="UNKNOWN",
+                        reason=(
+                            "Reconciliation raised "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    )
+                reconciliation_span.set_attribute(
+                    "rta.reconciliation.outcome",
+                    reconciliation.status,
                 )
 
             if reconciliation.status == "FOUND":
@@ -570,11 +666,19 @@ class EffectExecutor:
                 return result
 
             if reconciliation.status == "UNKNOWN":
-                reason = (
+                durable_reason = (
+                    reconciliation_exception_reason
+                    or durable_error_message(
+                        None,
+                        category="reconciliation_unknown",
+                        error_type="ReconciliationUnknown",
+                    )
+                )
+                live_reason = (
                     reconciliation.reason
                     or "外部副作用状态无法可靠确定。"
                 )
-                self.store.mark_unknown(effect_id, reason)
+                self.store.mark_unknown(effect_id, durable_reason)
                 transition_hook(
                     {
                         "effect_id": effect_id,
@@ -582,11 +686,11 @@ class EffectExecutor:
                         "tool_name": tool.name,
                         "from_state": "PREPARED",
                         "to_state": "UNKNOWN",
-                        "reason": reason,
+                        "reason": durable_reason,
                         "reconciliation_status": "UNKNOWN",
                     }
                 )
-                raise EffectStateUnknownError(reason)
+                raise EffectStateUnknownError(live_reason)
 
             transition_hook(
                 {

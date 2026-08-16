@@ -11,12 +11,13 @@ from mcp.client.stdio import stdio_client
 from mcp.types import (
     CallToolResult,
     PaginatedRequestParams,
-    TextContent,
     Tool,
 )
 from pydantic import BaseModel
 
 from reliable_task_agent.effects import ReconciliationResult
+from reliable_task_agent.durable_errors import durable_error_message
+from reliable_task_agent.telemetry import NOOP_TELEMETRY, Telemetry
 from reliable_task_agent.tools.registry import ToolExecutionResult
 from reliable_task_agent.tools.registry import ToolRegistry
 
@@ -175,19 +176,14 @@ def _map_call_result(
             data=data,
         )
 
-    text_errors = [
-        content.text
-        for content in result.content
-        if isinstance(content, TextContent)
-    ]
     return ToolExecutionResult(
         ok=False,
         tool_name=tool_name,
-        data=data,
-        error=(
-            "\n".join(text_errors)
-            if text_errors
-            else "MCP tool returned isError=true."
+        data={"isError": True},
+        error=durable_error_message(
+            None,
+            category="mcp_tool_error",
+            error_type="MCPToolError",
         ),
     )
 
@@ -197,25 +193,37 @@ async def _call_stdio_tool(
     *,
     tool_name: str,
     arguments: dict[str, Any],
+    telemetry: Telemetry | None = None,
 ) -> ToolExecutionResult:
-    try:
-        async with stdio_client(server.to_sdk_parameters()) as streams:
-            read_stream, write_stream = streams
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
-                if not isinstance(result, CallToolResult):
-                    raise TypeError(
-                        "MCP tools/call returned an unsupported result "
-                        f"type: {type(result).__name__}"
-                    )
-                return _map_call_result(tool_name, result)
-    except Exception as exc:
-        raise MCPInvocationError(
-            "MCP tool invocation failed for stdio server "
-            f"{server.command!r}, tool {tool_name!r}: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
+    observer = telemetry or NOOP_TELEMETRY
+    with observer.span(
+        "rta.mcp.call",
+        {
+            "rta.tool.name": tool_name,
+            "rta.mcp.transport": "stdio",
+        },
+        error_category="mcp_invocation",
+    ) as telemetry_span:
+        try:
+            async with stdio_client(server.to_sdk_parameters()) as streams:
+                read_stream, write_stream = streams
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, arguments)
+                    if not isinstance(result, CallToolResult):
+                        raise TypeError(
+                            "MCP tools/call returned an unsupported result "
+                            f"type: {type(result).__name__}"
+                        )
+                    mapped = _map_call_result(tool_name, result)
+                    telemetry_span.set_attribute("rta.tool.ok", mapped.ok)
+                    return mapped
+        except Exception as exc:
+            raise MCPInvocationError(
+                "MCP tool invocation failed for stdio server "
+                f"{server.command!r}, tool {tool_name!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
 
 async def invoke_stdio_tool(
@@ -224,6 +232,7 @@ async def invoke_stdio_tool(
     tool_name: str,
     arguments: dict[str, Any],
     policy: MCPToolPolicy,
+    telemetry: Telemetry | None = None,
 ) -> ToolExecutionResult:
     """Invoke an explicitly approved ordinary MCP tool through tools/call.
 
@@ -253,6 +262,7 @@ async def invoke_stdio_tool(
         server,
         tool_name=tool_name,
         arguments=arguments,
+        telemetry=telemetry,
     )
 
 
@@ -263,7 +273,12 @@ def _structured_result(
 ) -> dict[str, Any]:
     if not result.ok:
         raise MCPInvocationError(
-            f"MCP {purpose} tool returned an error: {result.error}"
+            f"MCP {purpose} tool returned an error. "
+            + durable_error_message(
+                None,
+                category=f"mcp_{purpose}_tool_error",
+                error_type="MCPToolError",
+            )
         )
     if not isinstance(result.data, dict):
         raise MCPInvocationError(
@@ -281,6 +296,8 @@ def register_mcp_effect_tools(
     registry: ToolRegistry,
     server: MCPStdioServer,
     policy: MCPToolPolicy,
+    *,
+    telemetry: Telemetry | None = None,
 ) -> None:
     """Register explicit MCP effects with the existing RTA Effect Boundary."""
 
@@ -299,6 +316,7 @@ def register_mcp_effect_tools(
                     server,
                     tool_name=_policy.tool_name,
                     arguments=arguments,
+                    telemetry=telemetry,
                 )
             )
             return _structured_result(result, purpose="effect")
@@ -316,6 +334,7 @@ def register_mcp_effect_tools(
                     arguments={
                         _policy.idempotency_argument: idempotency_key,
                     },
+                    telemetry=telemetry,
                 )
             )
             structured = _structured_result(
