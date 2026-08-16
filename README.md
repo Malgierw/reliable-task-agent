@@ -1,6 +1,6 @@
 # Reliable Task Agent
 
-Reliable Task Agent is a compact Python runtime for tool-using agents that need durable execution state, deterministic verification, and explicit handling of recoverable side effects. Its premise is simple: **Agent output != task completion**, and **checkpoint absence != proof that an external effect did not happen**. The runtime combines checkpoint/resume, verifier-driven bounded repair, workspace-scoped tool safety, persistent traces, and a durable Effect Boundary for explicitly registered side effects.
+Reliable Task Agent is a compact Python runtime for tool-using agents that need durable execution state, deterministic verification, and explicit handling of recoverable side effects. Its premise is simple: **Agent output != task completion**, and **checkpoint absence != proof that an external effect did not happen**. The v0.3.0 capability set combines checkpoint/resume, verifier-driven bounded repair, workspace-scoped tool safety, persistent traces, MCP integration, durable error sanitization, optional OpenTelemetry export, and a durable Effect Boundary for explicitly registered side effects.
 
 > **Agent output != task completion.**
 >
@@ -27,6 +27,7 @@ Reliable Task Agent treats model output as a proposal, verifies important result
 - **Verifier-driven Repair:** structured verification errors, runtime hard feedback, bounded repair attempts, and crash/resume-safe repair bookkeeping.
 - **Effect Boundary:** durable effect identity, receipts, reconciliation, and fail-closed handling for explicitly registered side-effecting tools.
 - **MCP Tool Adapter:** official MCP SDK integration for local stdio discovery, schema mapping, ordinary invocation, and explicitly policy-managed MCP effects.
+- **Durable Error Sanitization:** exception-derived diagnostics are reduced to structured, persistence-safe metadata before entering durable runtime state.
 - **Optional OpenTelemetry:** fail-open manual spans with optional OTLP/HTTP protobuf export; telemetry delivery is never part of runtime correctness.
 - **Safety and testing:** workspace-scoped file tools, path-traversal protection, deterministic verification, and failure-injection hooks.
 
@@ -34,23 +35,24 @@ Reliable Task Agent treats model output as a proposal, verifies important result
 
 ```mermaid
 flowchart TD
-    M["Model"] --> A["Agent Loop"]
+    MCP["MCP capability ingress"] --> A["Durable Agent Runtime"]
+    M["Model"] --> A
     A --> R["Tool Registry + Pydantic validation"]
     A --> C["Checkpoint / Resume"]
-    A --> T["Persistent Trace"]
+    A --> T["Persistent RunTrace"]
     R --> O["Ordinary workspace tools"]
     R --> V["Deterministic verifier"]
     V -->|"FAIL: structured hard feedback"| A
     V -->|"PASS"| S["SUCCESS"]
-    R --> E["Effect Executor"]
-    R --> M["MCP Tool Adapter"]
-    M --> MS["Local stdio MCP server"]
-    M -->|"explicit effect policy"| E
-    E --> L["Durable Effect Ledger"]
+    MCP --> MS["Local stdio MCP server"]
+    MCP -->|"explicit effect policy"| E["Effect Boundary"]
+    R --> E
+    E --> L["PREPARED / COMMITTED / UNKNOWN"]
     E --> B["External business system"]
-    L -->|"PREPARED: reconcile"| B
+    L -->|"idempotency + reconciliation"| B
     A -.-> OT["Optional OpenTelemetry spans"]
     OT -.-> OTL["OTLP/HTTP trace receiver"]
+    OTL -.-> AR["External agent-replay interoperability"]
 ```
 
 Ordinary tools remain compatible with the Tool Registry. Effect-managed tools must be registered explicitly and can execute only through the Effect Executor.
@@ -123,6 +125,14 @@ MCP create_ticket
 Recovery reuses the same Effect Ledger and reconciliation rules as non-MCP effects; there is no second MCP-specific state machine. The ordinary MCP invocation path denies `create_ticket`, preventing it from bypassing the Effect Boundary.
 
 A real configured-model smoke validation used `deepseek-v4-flash` to select MCP `create_ticket`, pass through `PREPARED -> COMMITTED`, create exactly one ticket, persist a completed Agent checkpoint, and return `SUCCESS`. This is evidence for that executed integration path, not a general guarantee about all models, servers, or external systems.
+
+## Durable Error Sanitization
+
+Exception-derived diagnostics cross a narrow sanitization boundary before entering durable `AgentCheckpoint`, `RunTrace`, `EffectStore`, or persisted `ToolExecutionResult.error` fields. Safe durable diagnostics may retain an exception `error_type`, a static code-defined `error_category`, an optional safe numeric HTTP status, and—for Pydantic validation failures—the field path and validation error code.
+
+These durable error summaries do not retain arbitrary raw exception messages, response bodies, Authorization headers, API keys or tokens, credential-bearing URLs or query secrets, MCP server error text, or rejected Pydantic input values. Live exceptions may still preserve their original caller-visible behavior; sanitization applies to the durable copy rather than changing runtime control flow.
+
+This is not general data-loss prevention. Checkpoint and recovery state can still contain task inputs, model messages, tool arguments, successful tool results, and effect receipts required for resume and result reconstruction. Runtime, checkpoint, trace, and Effect Ledger storage must therefore be treated as sensitive application data.
 
 ## OpenTelemetry and agent-replay
 
@@ -253,10 +263,10 @@ uv run --group benchmark pytest -q
 Current complete suite:
 
 ```text
-113 passed
+118 passed
 ```
 
-Tests cover tool validation, workspace boundaries, retries, traces, checkpoints, resume, completed-result reuse, verifier-driven repair, repair crash windows, Effect Ledger transitions, reconciliation, fail-closed UNKNOWN behavior, MCP discovery/invocation/effect recovery, OpenTelemetry/OTLP export, real SQLite fault injection, and the cross-runtime benchmark harness.
+Tests cover tool validation, workspace boundaries, retries, traces, checkpoints, resume, completed-result reuse, verifier-driven repair, repair crash windows, Effect Ledger transitions, reconciliation, fail-closed UNKNOWN behavior, durable error sanitization, MCP discovery/invocation/effect recovery, OpenTelemetry/OTLP export, real SQLite fault injection, and the cross-runtime benchmark harness.
 
 ## Limitations and non-goals
 
