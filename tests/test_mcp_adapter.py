@@ -8,11 +8,14 @@ import pytest
 
 from reliable_task_agent.mcp_adapter import (
     MCPDiscoveryError,
+    MCPEffectToolPolicy,
     MCPInvocationError,
     MCPStdioServer,
+    MCPToolPolicy,
     discover_stdio_tools,
     invoke_stdio_tool,
 )
+from reliable_task_agent.tools.tickets import CreateTicketArgs
 
 
 DEMO_SERVER = (
@@ -30,6 +33,22 @@ def demo_server() -> MCPStdioServer:
     )
 
 
+def demo_policy() -> MCPToolPolicy:
+    return MCPToolPolicy(
+        ordinary_tool_names=frozenset({"get_ticket"}),
+        effect_tools=(
+            MCPEffectToolPolicy(
+                tool_name="create_ticket",
+                description="Create a protected MCP ticket.",
+                args_model=CreateTicketArgs,
+                reconciliation_tool_name=(
+                    "get_ticket_by_idempotency_key"
+                ),
+            ),
+        ),
+    )
+
+
 def discover_demo_tools():
     return asyncio.run(
         discover_stdio_tools(
@@ -41,7 +60,11 @@ def discover_demo_tools():
 def test_discovers_and_maps_demo_mcp_tools() -> None:
     tools = {tool.name: tool for tool in discover_demo_tools()}
 
-    assert set(tools) == {"get_ticket", "create_ticket"}
+    assert set(tools) == {
+        "get_ticket",
+        "create_ticket",
+        "get_ticket_by_idempotency_key",
+    }
     assert tools["get_ticket"].description == (
         "Look up a ticket by its identifier."
     )
@@ -58,7 +81,11 @@ def test_discovers_and_maps_demo_mcp_tools() -> None:
     assert create_schema["type"] == "object"
     assert create_schema["properties"]["title"]["type"] == "string"
     assert create_schema["properties"]["description"]["type"] == "string"
-    assert set(create_schema["required"]) == {"title", "description"}
+    assert set(create_schema["required"]) == {
+        "title",
+        "description",
+        "idempotency_key",
+    }
 
     assert tools["get_ticket"].to_openai_schema() == {
         "type": "function",
@@ -106,7 +133,7 @@ def test_invokes_get_ticket_and_maps_mcp_result() -> None:
             demo_server(),
             tool_name="get_ticket",
             arguments={"ticket_id": "ticket-417"},
-            ordinary_tool_names={"get_ticket"},
+            policy=demo_policy(),
         )
     )
 
@@ -127,7 +154,7 @@ def test_maps_mcp_tool_error_without_transport_failure() -> None:
             demo_server(),
             tool_name="get_ticket",
             arguments={"ticket_id": "raise-error"},
-            ordinary_tool_names={"get_ticket"},
+            policy=demo_policy(),
         )
     )
 
@@ -152,7 +179,7 @@ def test_invocation_transport_failure_has_adapter_level_error() -> None:
                 server,
                 tool_name="get_ticket",
                 arguments={"ticket_id": "ticket-1"},
-                ordinary_tool_names={"get_ticket"},
+                policy=demo_policy(),
             )
         )
 
@@ -163,10 +190,21 @@ def test_create_ticket_is_not_exposed_as_an_ordinary_tool() -> None:
             MCPStdioServer(command="must-not-be-launched"),
             tool_name="create_ticket",
             arguments={"title": "A", "description": "B"},
-            ordinary_tool_names={"get_ticket"},
+            policy=demo_policy(),
         )
     )
 
     assert result.ok is False
     assert result.tool_name == "create_ticket"
-    assert "not explicitly approved" in result.error
+    assert "must execute through RTA Effect Boundary" in result.error
+
+
+def test_policy_rejects_ordinary_effect_overlap() -> None:
+    with pytest.raises(
+        ValueError,
+        match="both ordinary and effect-managed",
+    ):
+        MCPToolPolicy(
+            ordinary_tool_names=frozenset({"create_ticket"}),
+            effect_tools=demo_policy().effect_tools,
+        )
