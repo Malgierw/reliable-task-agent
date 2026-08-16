@@ -25,6 +25,10 @@ from reliable_task_agent.effects import (
     EffectSafetyError,
     EffectStore,
 )
+from reliable_task_agent.durable_errors import (
+    durable_error_details,
+    durable_error_message,
+)
 from reliable_task_agent.telemetry import NOOP_TELEMETRY, Telemetry
 
 
@@ -261,7 +265,12 @@ class AgentLoop:
                 "Effect-managed 工具缺少 EffectStore 配置："
                 f"{tool_name}"
             )
-            checkpoint.mark_failed(str(error))
+            checkpoint.mark_failed(
+                durable_error_message(
+                    error,
+                    category="effect_configuration",
+                )
+            )
             self._persist_checkpoint(checkpoint)
             self._record_event(
                 trace=trace,
@@ -271,7 +280,10 @@ class AgentLoop:
                     "stage": "effect_boundary",
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
-                    "message": str(error),
+                    **durable_error_details(
+                        error,
+                        category="effect_configuration",
+                    ),
                 },
             )
             raise error
@@ -291,7 +303,12 @@ class AgentLoop:
                 fault_hook=self._maybe_inject_fault,
             )
         except Exception as exc:
-            checkpoint.mark_failed(str(exc))
+            checkpoint.mark_failed(
+                durable_error_message(
+                    exc,
+                    category="effect_boundary",
+                )
+            )
             self._persist_checkpoint(checkpoint)
             self._record_event(
                 trace=trace,
@@ -301,8 +318,10 @@ class AgentLoop:
                     "stage": "effect_boundary",
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
+                    **durable_error_details(
+                        exc,
+                        category="effect_boundary",
+                    ),
                 },
             )
             raise
@@ -551,17 +570,19 @@ class AgentLoop:
                             "attempt": attempt,
                             "max_attempts": total_attempts,
                             "retryable": retryable,
-                            "error_type": type(exc).__name__,
-                            "status_code": getattr(
+                            **durable_error_details(
                                 exc,
-                                "status_code",
-                                None,
+                                category="model_request",
                             ),
-                            "message": str(exc),
                         },
                     )
                     
-                    checkpoint.mark_failed(str(exc))
+                    checkpoint.mark_failed(
+                        durable_error_message(
+                            exc,
+                            category="model_request",
+                        )
+                    )
                     self._persist_checkpoint(checkpoint)
                     
                     raise
@@ -579,13 +600,10 @@ class AgentLoop:
                         "attempt": attempt,
                         "next_attempt": attempt + 1,
                         "delay_seconds": delay,
-                        "error_type": type(exc).__name__,
-                        "status_code": getattr(
+                        **durable_error_details(
                             exc,
-                            "status_code",
-                            None,
+                            category="model_request",
                         ),
-                        "message": str(exc),
                     },
                 )
 
@@ -770,7 +788,10 @@ class AgentLoop:
                         "ok": False,
                         "tool_name": tool_name,
                         "data": None,
-                        "error": f"工具参数解析失败：{exc}",
+                        "error": durable_error_message(
+                            exc,
+                            category="tool_argument_json",
+                        ),
                     }
                     result_data = failure_data
 
@@ -1054,8 +1075,9 @@ class AgentLoop:
                         "ok": False,
                         "tool_name": tool_name,
                         "data": None,
-                        "error": (
-                            f"工具参数解析失败：{exc}"
+                        "error": durable_error_message(
+                            exc,
+                            category="tool_argument_json",
                         ),
                     }
 

@@ -42,7 +42,8 @@ def test_calculate_shannon_capacity_rejects_invalid_bandwidth() -> None:
     assert result.ok is False
     assert result.data is None
     assert result.error is not None
-    assert "greater than 0" in result.error
+    assert '"field":"bandwidth_hz"' in result.error
+    assert '"code":"greater_than"' in result.error
 
 def test_read_text_file_success(tmp_path) -> None:
     """应当能够读取工作区内的文本文件。"""
@@ -94,7 +95,7 @@ def test_read_text_file_rejects_outside_path(tmp_path) -> None:
     assert result.ok is False
     assert result.data is None
     assert result.error is not None
-    assert "禁止读取工作区之外" in result.error
+    assert '"error_category":"workspace_violation"' in result.error
     
 def test_list_workspace_files_success(
     tmp_path,
@@ -204,10 +205,7 @@ def test_list_workspace_files_rejects_outside_path(
     assert result.data is None
     assert result.error is not None
 
-    assert (
-        "workspace 之外"
-        in result.error
-    )
+    assert '"error_category":"workspace_violation"' in result.error
 
 def test_list_workspace_files_respects_max_files(
     tmp_path,
@@ -346,7 +344,7 @@ def test_search_text_rejects_outside_path(
 
     assert result.ok is False
     assert result.data is None
-    assert "workspace 之外" in result.error
+    assert '"error_category":"workspace_violation"' in result.error
 
 def test_search_text_respects_max_matches(
     tmp_path,
@@ -540,7 +538,7 @@ def test_analyze_csv_rejects_outside_path(
 
     assert result.ok is False
     assert result.data is None
-    assert "workspace 之外" in result.error
+    assert '"error_category":"workspace_violation"' in result.error
 
 def test_analyze_csv_respects_max_rows(
     tmp_path,
@@ -607,7 +605,7 @@ def test_analyze_csv_rejects_non_csv(
 
     assert result.ok is False
     assert result.data is None
-    assert ".csv" in result.error
+    assert '"error_category":"invalid_file_type"' in result.error
 
 def test_write_analysis_report_success(
     tmp_path,
@@ -713,7 +711,7 @@ def test_write_analysis_report_rejects_existing_file(
     assert result.ok is False
     assert result.data is None
     assert result.error is not None
-    assert "已经存在" in result.error
+    assert '"error_category":"file_already_exists"' in result.error
 
     # 原文件不能被破坏。
     assert report_path.read_text(
@@ -748,10 +746,7 @@ def test_write_analysis_report_rejects_outside_path(
     assert result.data is None
     assert result.error is not None
 
-    assert (
-        "workspace 之外"
-        in result.error
-    )
+    assert '"error_category":"workspace_violation"' in result.error
 
     assert not (
         tmp_path / "outside.md"
@@ -779,7 +774,7 @@ def test_write_analysis_report_rejects_non_markdown(
     assert result.ok is False
     assert result.data is None
     assert result.error is not None
-    assert ".md" in result.error
+    assert '"error_category":"invalid_output_type"' in result.error
 
     assert not (
         tmp_path / "config.json"
@@ -1085,7 +1080,4 @@ def test_verify_analysis_report_rejects_outside_path(
     assert result.data is None
     assert result.error is not None
 
-    assert (
-        "workspace 之外"
-        in result.error
-    )
+    assert '"error_category":"workspace_violation"' in result.error

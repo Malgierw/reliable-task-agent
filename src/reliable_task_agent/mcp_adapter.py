@@ -11,12 +11,12 @@ from mcp.client.stdio import stdio_client
 from mcp.types import (
     CallToolResult,
     PaginatedRequestParams,
-    TextContent,
     Tool,
 )
 from pydantic import BaseModel
 
 from reliable_task_agent.effects import ReconciliationResult
+from reliable_task_agent.durable_errors import durable_error_message
 from reliable_task_agent.telemetry import NOOP_TELEMETRY, Telemetry
 from reliable_task_agent.tools.registry import ToolExecutionResult
 from reliable_task_agent.tools.registry import ToolRegistry
@@ -176,19 +176,14 @@ def _map_call_result(
             data=data,
         )
 
-    text_errors = [
-        content.text
-        for content in result.content
-        if isinstance(content, TextContent)
-    ]
     return ToolExecutionResult(
         ok=False,
         tool_name=tool_name,
-        data=data,
-        error=(
-            "\n".join(text_errors)
-            if text_errors
-            else "MCP tool returned isError=true."
+        data={"isError": True},
+        error=durable_error_message(
+            None,
+            category="mcp_tool_error",
+            error_type="MCPToolError",
         ),
     )
 
@@ -278,7 +273,12 @@ def _structured_result(
 ) -> dict[str, Any]:
     if not result.ok:
         raise MCPInvocationError(
-            f"MCP {purpose} tool returned an error: {result.error}"
+            f"MCP {purpose} tool returned an error. "
+            + durable_error_message(
+                None,
+                category=f"mcp_{purpose}_tool_error",
+                error_type="MCPToolError",
+            )
         )
     if not isinstance(result.data, dict):
         raise MCPInvocationError(

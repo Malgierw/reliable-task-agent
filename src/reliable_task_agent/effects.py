@@ -11,6 +11,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError
 
+from reliable_task_agent.durable_errors import (
+    durable_error_message,
+    durable_validation_error_message,
+    normalize_durable_error_message,
+)
 from reliable_task_agent.tools.registry import (
     RegisteredTool,
     ToolExecutionResult,
@@ -383,6 +388,10 @@ class EffectStore:
         """把 PREPARED 原子转换为 UNKNOWN。"""
 
         now = utc_now().isoformat()
+        safe_reason = normalize_durable_error_message(
+            reason,
+            fallback_category="effect_unknown",
+        )
 
         with self._connect() as connection:
             connection.execute(
@@ -393,7 +402,7 @@ class EffectStore:
                     updated_at = ?
                 WHERE effect_id = ? AND state = 'PREPARED'
                 """,
-                (reason, now, effect_id),
+                (safe_reason, now, effect_id),
             )
             row = connection.execute(
                 "SELECT * FROM effects WHERE effect_id = ?",
@@ -505,7 +514,10 @@ class EffectExecutor:
             return ToolExecutionResult(
                 ok=False,
                 tool_name=tool.name,
-                error=f"工具参数校验失败：{exc}",
+                error=durable_validation_error_message(
+                    exc,
+                    category="tool_argument_validation",
+                ),
             )
 
         arguments_hash = hash_arguments(validated_args)
@@ -580,6 +592,7 @@ class EffectExecutor:
                 or f"Effect 状态为 UNKNOWN：{effect_id}"
             )
 
+        reconciliation_exception_reason: str | None = None
         if not created:
             with self.telemetry.span(
                 "rta.reconciliation",
@@ -610,6 +623,10 @@ class EffectExecutor:
                     reconciliation_span.record_error(
                         exc,
                         category="reconciliation",
+                    )
+                    reconciliation_exception_reason = durable_error_message(
+                        exc,
+                        category="reconciliation_exception",
                     )
                     reconciliation = ReconciliationResult(
                         status="UNKNOWN",
@@ -649,11 +666,19 @@ class EffectExecutor:
                 return result
 
             if reconciliation.status == "UNKNOWN":
-                reason = (
+                durable_reason = (
+                    reconciliation_exception_reason
+                    or durable_error_message(
+                        None,
+                        category="reconciliation_unknown",
+                        error_type="ReconciliationUnknown",
+                    )
+                )
+                live_reason = (
                     reconciliation.reason
                     or "外部副作用状态无法可靠确定。"
                 )
-                self.store.mark_unknown(effect_id, reason)
+                self.store.mark_unknown(effect_id, durable_reason)
                 transition_hook(
                     {
                         "effect_id": effect_id,
@@ -661,11 +686,11 @@ class EffectExecutor:
                         "tool_name": tool.name,
                         "from_state": "PREPARED",
                         "to_state": "UNKNOWN",
-                        "reason": reason,
+                        "reason": durable_reason,
                         "reconciliation_status": "UNKNOWN",
                     }
                 )
-                raise EffectStateUnknownError(reason)
+                raise EffectStateUnknownError(live_reason)
 
             transition_hook(
                 {

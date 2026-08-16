@@ -351,7 +351,9 @@ def test_agent_records_invalid_tool_arguments() -> None:
 
     assert tool_result.details["ok"] is False
     assert tool_result.details["data"] is None
-    assert "工具参数解析失败" in tool_result.details["error"]
+    assert '"error_category":"tool_argument_json"' in (
+        tool_result.details["error"]
+    )
 
     # 即使参数错误，Agent 仍会把错误结果返回模型，
     # 让模型进行第二轮回答。
@@ -427,8 +429,8 @@ def test_agent_records_tool_validation_failure() -> None:
     # Registry 的 Pydantic 校验应拒绝负数带宽。
     assert tool_result.details["ok"] is False
     assert tool_result.details["data"] is None
-    assert "工具参数校验失败" in tool_result.details["error"]
-    assert "greater than 0" in tool_result.details["error"]
+    assert '"field":"bandwidth_hz"' in tool_result.details["error"]
+    assert '"code":"greater_than"' in tool_result.details["error"]
 
     # 错误结果仍应返回给模型进行第二轮回答。
     assert len(fake_client.completions.requests) == 2
@@ -464,7 +466,8 @@ def test_agent_records_model_request_error() -> None:
     assert error_event.step == 1
     assert error_event.details["stage"] == "model_request"
     assert error_event.details["error_type"] == "RuntimeError"
-    assert error_event.details["message"] == "模拟网络错误"
+    assert error_event.details["error_category"] == "model_request"
+    assert "message" not in error_event.details
     
 def test_agent_retries_transient_model_error() -> None:
     """临时性模型错误应自动重试并记录 Trace。"""
@@ -578,7 +581,10 @@ def test_agent_persists_error_trace(tmp_path) -> None:
 
     assert error_event.event_type == "error"
     assert error_event.details["stage"] == "model_request"
-    assert error_event.details["message"] == "模拟网络错误"
+    assert error_event.details["error_type"] == "RuntimeError"
+    assert error_event.details["error_category"] == "model_request"
+    assert "message" not in error_event.details
+    assert "模拟网络错误" not in loaded_trace.to_pretty_json()
 
 def test_agent_persists_completed_checkpoint(
     tmp_path,

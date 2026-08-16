@@ -122,7 +122,7 @@ def test_discovery_failure_has_adapter_level_error() -> None:
 
     with pytest.raises(
         MCPDiscoveryError,
-        match="MCP tool discovery failed for stdio server",
+        match="MCP tool discovery failed",
     ):
         asyncio.run(discover_stdio_tools(server))
 
@@ -161,7 +161,8 @@ def test_maps_mcp_tool_error_without_transport_failure() -> None:
     assert result.ok is False
     assert result.tool_name == "get_ticket"
     assert result.data["isError"] is True
-    assert "demo ticket lookup failed" in result.error
+    assert '"error_category":"mcp_tool_error"' in result.error
+    assert "demo ticket lookup failed" not in result.error
 
 
 def test_invocation_transport_failure_has_adapter_level_error() -> None:
@@ -172,7 +173,7 @@ def test_invocation_transport_failure_has_adapter_level_error() -> None:
 
     with pytest.raises(
         MCPInvocationError,
-        match="MCP tool invocation failed for stdio server",
+        match="MCP tool invocation failed",
     ):
         asyncio.run(
             invoke_stdio_tool(
