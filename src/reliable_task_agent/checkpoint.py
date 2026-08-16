@@ -62,6 +62,21 @@ class AgentCheckpoint(BaseModel):
         description="已经成功执行过的工具调用。",
     )
 
+    repair_count: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "确定性验证失败后，运行时已经请求的修复周期数量。"
+        ),
+    )
+
+    handled_verification_tool_call_ids: set[str] = Field(
+        default_factory=set,
+        description=(
+            "已经消费修复周期的失败 Verifier 工具调用编号。"
+        ),
+    )
+
     status: CheckpointStatus = "running"
 
     final_answer: str | None = None

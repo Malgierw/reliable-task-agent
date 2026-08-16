@@ -14,3 +14,12 @@ wheels/
 runs/
 
 demo_workspace/analysis_report.md
+
+.smoke-backup/
+smoke_runs/
+
+# Generated reliability benchmark artifacts
+benchmark_results/
+benchmark_results/**/*.sqlite3
+benchmark_results/**/*.sqlite3-wal
+benchmark_results/**/*.sqlite3-shm

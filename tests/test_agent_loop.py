@@ -11,6 +11,7 @@ import pytest
 
 from reliable_task_agent.agent_loop import AgentLoop
 from reliable_task_agent.tools.builtin import build_default_registry
+from reliable_task_agent.tools.registry import ToolExecutionResult
 from reliable_task_agent.trace_store import TraceStore
 from reliable_task_agent.checkpoint_store import CheckpointStore
 from reliable_task_agent.checkpoint import (
@@ -786,6 +787,530 @@ def test_agent_resume_requires_checkpoint_store() -> None:
         match="CheckpointStore",
     ):
         agent.resume("e" * 32)
+
+
+def test_verification_failure_requests_persisted_repair(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """验证失败应记录 repair 事件，并把硬反馈持久化给下一轮。"""
+
+    registry = build_default_registry()
+
+    monkeypatch.setattr(
+        registry,
+        "execute",
+        lambda name, arguments: ToolExecutionResult(
+            ok=True,
+            tool_name=name,
+            data={
+                "verification_passed": False,
+                "errors": ["throughput_mbps.count missing"],
+                "error_details": [
+                    {
+                        "type": "missing_metric_field",
+                        "field": "throughput_mbps.count",
+                        "expected": 5,
+                        "actual": None,
+                    }
+                ],
+                "checks": {
+                    "aggregate_metrics_match": False,
+                },
+            },
+        ),
+    )
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="call_verify_failed",
+                        function=FakeFunction(
+                            name="verify_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(content="Repair requested."),
+        ]
+    )
+
+    store = CheckpointStore(tmp_path / "runs")
+    agent = AgentLoop(
+        registry,
+        client=fake_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    assert agent.run("Verify the report.") == "Repair requested."
+    assert agent.last_checkpoint is not None
+
+    checkpoint = store.load(agent.last_checkpoint.run_id)
+    assert checkpoint.repair_count == 1
+
+    repair_events = [
+        event
+        for event in agent.last_trace.events
+        if event.event_type == "repair_requested"
+    ]
+
+    assert len(repair_events) == 1
+    assert repair_events[0].details == {
+        "repair_attempt": 1,
+        "max_repair_attempts": 2,
+        "verifier_errors": [
+            "throughput_mbps.count missing"
+        ],
+        "verifier_error_details": [
+            {
+                "type": "missing_metric_field",
+                "field": "throughput_mbps.count",
+                "expected": 5,
+                "actual": None,
+            }
+        ],
+        "verifier_checks": {
+            "aggregate_metrics_match": False,
+        },
+    }
+
+    next_request_messages = (
+        fake_client.completions.requests[1]["messages"]
+    )
+
+    assert next_request_messages[-2]["role"] == "tool"
+    assert next_request_messages[-1]["role"] == "system"
+    assert "deterministic verification failed" in (
+        next_request_messages[-1]["content"]
+    )
+    assert "throughput_mbps.count missing" in (
+        next_request_messages[-1]["content"]
+    )
+    for structured_value in (
+        "missing_metric_field",
+        "throughput_mbps.count",
+        '"expected": 5',
+        '"actual": null',
+    ):
+        assert structured_value in (
+            next_request_messages[-1]["content"]
+        )
+    assert next_request_messages[-1] in checkpoint.messages
+
+
+def test_verification_repair_then_passes(
+    monkeypatch,
+) -> None:
+    """验证失败、修复、重新验证通过后应正常完成。"""
+
+    registry = build_default_registry()
+    verification_count = 0
+
+    def execute(
+        name: str,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult:
+        nonlocal verification_count
+
+        if name == "verify_analysis_report":
+            verification_count += 1
+            passed = verification_count == 2
+
+            return ToolExecutionResult(
+                ok=True,
+                tool_name=name,
+                data={
+                    "verification_passed": passed,
+                    "errors": [] if passed else ["bad metric"],
+                    "checks": {
+                        "aggregate_metrics_match": passed,
+                    },
+                },
+            )
+
+        return ToolExecutionResult(
+            ok=True,
+            tool_name=name,
+            data={"repaired": True},
+        )
+
+    monkeypatch.setattr(registry, "execute", execute)
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="verify_1",
+                        function=FakeFunction(
+                            name="verify_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="repair_1",
+                        function=FakeFunction(
+                            name="write_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="verify_2",
+                        function=FakeFunction(
+                            name="verify_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(content="SUCCESS"),
+        ]
+    )
+
+    agent = AgentLoop(
+        registry,
+        client=fake_client,
+        model="fake-model",
+        max_steps=4,
+    )
+
+    assert agent.run("Repair and verify.") == "SUCCESS"
+    assert verification_count == 2
+    assert agent.last_checkpoint.repair_count == 1
+    assert agent.last_checkpoint.status == "completed"
+
+
+def test_repeated_verification_failures_exhaust_repairs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """两次 repair 后的第三次验证失败应确定性终止。"""
+
+    registry = build_default_registry()
+
+    monkeypatch.setattr(
+        registry,
+        "execute",
+        lambda name, arguments: ToolExecutionResult(
+            ok=True,
+            tool_name=name,
+            data={
+                "verification_passed": False,
+                "errors": ["still invalid"],
+                "checks": {"aggregate_metrics_match": False},
+            },
+        ),
+    )
+
+    verifier_message = lambda call_id: FakeMessage(
+        content="",
+        tool_calls=[
+            FakeToolCall(
+                id=call_id,
+                function=FakeFunction(
+                    name="verify_analysis_report",
+                    arguments="{}",
+                ),
+            )
+        ],
+    )
+
+    fake_client = FakeClient(
+        messages=[
+            verifier_message("verify_failure_1"),
+            verifier_message("verify_failure_2"),
+            verifier_message("verify_failure_3"),
+        ]
+    )
+
+    store = CheckpointStore(tmp_path / "runs")
+    agent = AgentLoop(
+        registry,
+        client=fake_client,
+        model="fake-model",
+        max_steps=4,
+        max_repair_attempts=2,
+        checkpoint_store=store,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="已用尽 2 次修复机会",
+    ):
+        agent.run("Keep verifying.")
+
+    checkpoint = store.load(agent.last_checkpoint.run_id)
+    assert checkpoint.status == "failed"
+    assert checkpoint.repair_count == 2
+
+    repair_events = [
+        event
+        for event in agent.last_trace.events
+        if event.event_type == "repair_requested"
+    ]
+    assert [
+        event.details["repair_attempt"]
+        for event in repair_events
+    ] == [1, 2]
+
+    assert agent.last_trace.events[-1].event_type == "error"
+    assert agent.last_trace.events[-1].details["stage"] == (
+        "verification_repair"
+    )
+
+
+def test_resume_preserves_repair_count(
+    tmp_path,
+) -> None:
+    """恢复已有 repair 周期时不得把计数重置为零。"""
+
+    run_id = "a" * 32
+    checkpoint = AgentCheckpoint(
+        run_id=run_id,
+        next_step=2,
+        repair_count=1,
+        messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "repair"},
+            {
+                "role": "system",
+                "content": "existing verifier repair guidance",
+            },
+        ],
+    )
+    checkpoint.mark_failed("simulated crash during repair")
+
+    store = CheckpointStore(tmp_path / "runs")
+    store.save(checkpoint)
+
+    fake_client = FakeClient(
+        messages=[FakeMessage(content="resumed")]
+    )
+    agent = AgentLoop(
+        build_default_registry(),
+        client=fake_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    assert agent.resume(run_id) == "resumed"
+    assert store.load(run_id).repair_count == 1
+    assert (
+        fake_client.completions.requests[0]["messages"][-1][
+            "content"
+        ]
+        == "existing verifier repair guidance"
+    )
+
+
+def test_resume_reconciles_crash_before_repair_bookkeeping(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Verifier tool message 落盘后的崩溃应在恢复时只消费一次 repair。"""
+
+    verifier_tool_call_id = "verify_before_repair_crash"
+    registry = build_default_registry()
+    execute_calls: list[str] = []
+
+    def execute(
+        name: str,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult:
+        execute_calls.append(name)
+
+        if name == "verify_analysis_report":
+            return ToolExecutionResult(
+                ok=True,
+                tool_name=name,
+                data={
+                    "verification_passed": False,
+                    "errors": ["throughput_mbps.count missing"],
+                    "error_details": [
+                        {
+                            "type": "missing_metric_field",
+                            "field": "throughput_mbps.count",
+                            "expected": 5,
+                            "actual": None,
+                        }
+                    ],
+                    "checks": {
+                        "aggregate_metrics_match": False,
+                    },
+                },
+            )
+
+        return ToolExecutionResult(
+            ok=True,
+            tool_name=name,
+            data={"repaired": True},
+        )
+
+    monkeypatch.setattr(registry, "execute", execute)
+
+    def crash_before_repair_bookkeeping(
+        stage: str,
+    ) -> None:
+        if stage == "after_tool_message_checkpoint":
+            raise RuntimeError(
+                "simulated crash before repair bookkeeping"
+            )
+
+    store = CheckpointStore(tmp_path / "runs")
+    first_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id=verifier_tool_call_id,
+                        function=FakeFunction(
+                            name="verify_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            )
+        ]
+    )
+    first_agent = AgentLoop(
+        registry,
+        client=first_client,
+        model="fake-model",
+        checkpoint_store=store,
+        fault_hook=crash_before_repair_bookkeeping,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="simulated crash before repair bookkeeping",
+    ):
+        first_agent.run("Verify and repair.")
+
+    run_id = first_agent.last_checkpoint.run_id
+    crashed_checkpoint = store.load(run_id)
+
+    assert crashed_checkpoint.repair_count == 0
+    assert (
+        verifier_tool_call_id
+        not in crashed_checkpoint.handled_verification_tool_call_ids
+    )
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == verifier_tool_call_id
+        for message in crashed_checkpoint.messages
+    )
+
+    resumed_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="repair_after_resume",
+                        function=FakeFunction(
+                            name="write_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(content="Repair path continued."),
+        ]
+    )
+    resumed_agent = AgentLoop(
+        registry,
+        client=resumed_client,
+        model="fake-model",
+        checkpoint_store=store,
+    )
+
+    assert resumed_agent.resume(run_id) == (
+        "Repair path continued."
+    )
+
+    final_checkpoint = store.load(run_id)
+    guidance_messages = [
+        message
+        for message in final_checkpoint.messages
+        if message.get("role") == "system"
+        and "Runtime verifier guidance" in message.get(
+            "content",
+            "",
+        )
+    ]
+
+    assert final_checkpoint.repair_count == 1
+    assert guidance_messages and len(guidance_messages) == 1
+    assert (
+        verifier_tool_call_id
+        in final_checkpoint.handled_verification_tool_call_ids
+    )
+    assert execute_calls.count("verify_analysis_report") == 1
+    assert execute_calls.count("write_analysis_report") == 1
+
+
+def test_verifier_execution_error_does_not_request_repair(
+    monkeypatch,
+) -> None:
+    """普通工具执行错误（包括 verifier 错误）不属于 repair 触发条件。"""
+
+    registry = build_default_registry()
+    monkeypatch.setattr(
+        registry,
+        "execute",
+        lambda name, arguments: ToolExecutionResult(
+            ok=False,
+            tool_name=name,
+            error="missing report",
+        ),
+    )
+
+    fake_client = FakeClient(
+        messages=[
+            FakeMessage(
+                content="",
+                tool_calls=[
+                    FakeToolCall(
+                        id="verify_error",
+                        function=FakeFunction(
+                            name="verify_analysis_report",
+                            arguments="{}",
+                        ),
+                    )
+                ],
+            ),
+            FakeMessage(content="Report is missing."),
+        ]
+    )
+    agent = AgentLoop(
+        registry,
+        client=fake_client,
+        model="fake-model",
+    )
+
+    assert agent.run("Verify.") == "Report is missing."
+    assert agent.last_checkpoint.repair_count == 0
+    assert "repair_requested" not in [
+        event.event_type
+        for event in agent.last_trace.events
+    ]
 
 def test_resume_reuses_completed_tool_result(
     tmp_path,

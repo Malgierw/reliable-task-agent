@@ -9,6 +9,16 @@ from pydantic import BaseModel, ValidationError
 # 规定工具执行函数的形式：
 # 接收一个经过 Pydantic 校验的参数对象，返回任意类型结果。
 ToolHandler = Callable[[BaseModel], Any]
+EffectHandler = Callable[[BaseModel, str], Any]
+EffectReconciler = Callable[[BaseModel, str], Any]
+
+
+@dataclass(frozen=True)
+class EffectSpec:
+    """Effect Boundary 执行与对账一个副作用所需的回调。"""
+
+    execute: EffectHandler
+    reconcile: EffectReconciler
 
 
 @dataclass(frozen=True)
@@ -18,7 +28,8 @@ class RegisteredTool:
     name: str
     description: str
     args_model: type[BaseModel]
-    handler: ToolHandler
+    handler: ToolHandler | None
+    effect_spec: EffectSpec | None = None
 
     def to_openai_schema(self) -> dict[str, Any]:
         """将工具转换为大模型 Function Calling 所需的格式。"""
@@ -66,6 +77,31 @@ class ToolRegistry:
             handler=handler,
         )
 
+    def register_effect(
+        self,
+        *,
+        name: str,
+        description: str,
+        args_model: type[BaseModel],
+        execute: EffectHandler,
+        reconcile: EffectReconciler,
+    ) -> None:
+        """注册只能通过 Runtime Effect Boundary 执行的工具。"""
+
+        if name in self._tools:
+            raise ValueError(f"工具已经存在：{name}")
+
+        self._tools[name] = RegisteredTool(
+            name=name,
+            description=description,
+            args_model=args_model,
+            handler=None,
+            effect_spec=EffectSpec(
+                execute=execute,
+                reconcile=reconcile,
+            ),
+        )
+
     def get(self, name: str) -> RegisteredTool:
         """根据名称获取工具。"""
         try:
@@ -97,6 +133,24 @@ class ToolRegistry:
                 ok=False,
                 tool_name=name,
                 error=str(exc),
+            )
+
+        if tool.effect_spec is not None:
+            return ToolExecutionResult(
+                ok=False,
+                tool_name=name,
+                error=(
+                    "Effect-managed 工具不能通过 "
+                    "ToolRegistry.execute() 直接执行；"
+                    "必须使用 Runtime Effect Boundary。"
+                ),
+            )
+
+        if tool.handler is None:
+            return ToolExecutionResult(
+                ok=False,
+                tool_name=name,
+                error="普通工具缺少 handler。",
             )
 
         try:

@@ -883,6 +883,7 @@ def test_verify_analysis_report_success(
     ]
 
     assert verify_result.data["errors"] == []
+    assert verify_result.data["error_details"] == []
 
 def test_verify_analysis_report_rejects_wrong_failed_runs(
     tmp_path,
@@ -1053,6 +1054,13 @@ def test_verify_analysis_report_rejects_wrong_metrics(
         ]
         is False
     )
+
+    assert {
+        "type": "metric_value_mismatch",
+        "field": "throughput_mbps.mean",
+        "expected": 90.0,
+        "actual": 999.0,
+    } in result.data["error_details"]
 
 def test_verify_analysis_report_rejects_outside_path(
     tmp_path,
