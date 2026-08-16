@@ -474,13 +474,22 @@ class AgentLoop:
 
         raise RuntimeError("模型请求重试流程异常结束。")
 
-    def run(self, user_input: str) -> str:
+    def run(
+        self,
+        user_input: str,
+        *,
+        run_id: str | None = None,
+    ) -> str:
         """启动一个新的 Agent 任务。"""
 
         if not user_input.strip():
             raise ValueError("用户输入不能为空。")
 
-        trace = RunTrace()
+        trace = (
+            RunTrace()
+            if run_id is None
+            else RunTrace(run_id=run_id)
+        )
         self.last_trace = trace
         self._persist_trace(trace)
 
