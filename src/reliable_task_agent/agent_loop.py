@@ -20,6 +20,11 @@ from reliable_task_agent.checkpoint import (
     CompletedToolCall,
 )
 from reliable_task_agent.checkpoint_store import CheckpointStore
+from reliable_task_agent.effects import (
+    EffectExecutor,
+    EffectSafetyError,
+    EffectStore,
+)
 
 
 
@@ -79,6 +84,7 @@ class AgentLoop:
         sleep_fn: Callable[[float], None] = time.sleep,
         trace_store: TraceStore | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        effect_store: EffectStore | None = None,
         fault_hook: Callable[[str], None] | None = None,
     ) -> None:
         
@@ -117,6 +123,11 @@ class AgentLoop:
         self.sleep_fn = sleep_fn
         self.trace_store = trace_store
         self.checkpoint_store = checkpoint_store
+        self.effect_executor = (
+            EffectExecutor(effect_store)
+            if effect_store is not None
+            else None
+        )
         self.fault_hook = fault_hook
         
         self.last_trace: RunTrace | None = None
@@ -182,6 +193,83 @@ class AgentLoop:
         )
 
         self._persist_trace(trace)
+
+    def _execute_tool_call(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        checkpoint: AgentCheckpoint,
+        trace: RunTrace,
+        step: int,
+    ) -> Any:
+        """通过普通路径或受保护 Effect Boundary 执行工具。"""
+
+        try:
+            tool = self.registry.get(tool_name)
+        except KeyError:
+            return self.registry.execute(
+                tool_name,
+                arguments,
+            )
+
+        if tool.effect_spec is None:
+            return self.registry.execute(
+                tool_name,
+                arguments,
+            )
+
+        if self.effect_executor is None:
+            error = EffectSafetyError(
+                "Effect-managed 工具缺少 EffectStore 配置："
+                f"{tool_name}"
+            )
+            checkpoint.mark_failed(str(error))
+            self._persist_checkpoint(checkpoint)
+            self._record_event(
+                trace=trace,
+                step=step,
+                event_type="error",
+                details={
+                    "stage": "effect_boundary",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "message": str(error),
+                },
+            )
+            raise error
+
+        try:
+            return self.effect_executor.execute(
+                run_id=checkpoint.run_id,
+                tool_call_id=tool_call_id,
+                tool=tool,
+                arguments=arguments,
+                transition_hook=lambda details: self._record_event(
+                    trace=trace,
+                    step=step,
+                    event_type="effect_transition",
+                    details=details,
+                ),
+                fault_hook=self._maybe_inject_fault,
+            )
+        except Exception as exc:
+            checkpoint.mark_failed(str(exc))
+            self._persist_checkpoint(checkpoint)
+            self._record_event(
+                trace=trace,
+                step=step,
+                event_type="error",
+                details={
+                    "stage": "effect_boundary",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise
 
     def _handle_verification_result(
         self,
@@ -534,6 +622,43 @@ class AgentLoop:
                             "工具参数必须是 JSON 对象。"
                         )
 
+                except (json.JSONDecodeError, ValueError) as exc:
+                    failure_data = {
+                        "ok": False,
+                        "tool_name": tool_name,
+                        "data": None,
+                        "error": f"工具参数解析失败：{exc}",
+                    }
+                    result_data = failure_data
+
+                    self._record_event(
+                        trace=trace,
+                        step=step,
+                        event_type="tool_call",
+                        details={
+                            "tool_call_id": tool_call.id,
+                            "tool_name": tool_name,
+                            "raw_arguments": raw_arguments,
+                        },
+                    )
+
+                    self._record_event(
+                        trace=trace,
+                        step=step,
+                        event_type="tool_result",
+                        details={
+                            "tool_call_id": tool_call.id,
+                            **failure_data,
+                        },
+                    )
+
+                    tool_content = json.dumps(
+                        failure_data,
+                        ensure_ascii=False,
+                    )
+
+                else:
+
                     self._record_event(
                         trace=trace,
                         step=step,
@@ -549,9 +674,13 @@ class AgentLoop:
                     self._maybe_inject_fault(
                         "before_tool_execute"
                     )
-                    result = self.registry.execute(
-                        tool_name,
-                        arguments,
+                    result = self._execute_tool_call(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        checkpoint=checkpoint,
+                        trace=trace,
+                        step=step,
                     )
 
                     result_data = result.model_dump(
@@ -586,41 +715,6 @@ class AgentLoop:
 
                     tool_content = json.dumps(
                         result_data,
-                        ensure_ascii=False,
-                    )
-
-                except (json.JSONDecodeError, ValueError) as exc:
-                    failure_data = {
-                        "ok": False,
-                        "tool_name": tool_name,
-                        "data": None,
-                        "error": f"工具参数解析失败：{exc}",
-                    }
-                    result_data = failure_data
-
-                    self._record_event(
-                        trace=trace,
-                        step=step,
-                        event_type="tool_call",
-                        details={
-                            "tool_call_id": tool_call.id,
-                            "tool_name": tool_name,
-                            "raw_arguments": raw_arguments,
-                        },
-                    )
-
-                    self._record_event(
-                        trace=trace,
-                        step=step,
-                        event_type="tool_result",
-                        details={
-                            "tool_call_id": tool_call.id,
-                            **failure_data,
-                        },
-                    )
-
-                    tool_content = json.dumps(
-                        failure_data,
                         ensure_ascii=False,
                     )
 
@@ -809,6 +903,32 @@ class AgentLoop:
                             "工具参数必须是 JSON 对象。"
                         )
 
+                except (
+                    json.JSONDecodeError,
+                    ValueError,
+                ) as exc:
+                    result_data = {
+                        "ok": False,
+                        "tool_name": tool_name,
+                        "data": None,
+                        "error": (
+                            f"工具参数解析失败：{exc}"
+                        ),
+                    }
+
+                    self._record_event(
+                        trace=trace,
+                        step=checkpoint.next_step,
+                        event_type="tool_result",
+                        details={
+                            "tool_call_id": tool_call_id,
+                            "resumed": True,
+                            **result_data,
+                        },
+                    )
+
+                else:
+
                     self._record_event(
                         trace=trace,
                         step=checkpoint.next_step,
@@ -821,9 +941,13 @@ class AgentLoop:
                         },
                     )
 
-                    result = self.registry.execute(
-                        tool_name,
-                        arguments,
+                    result = self._execute_tool_call(
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        checkpoint=checkpoint,
+                        trace=trace,
+                        step=checkpoint.next_step,
                     )
 
                     result_data = result.model_dump(
@@ -842,30 +966,6 @@ class AgentLoop:
                     self._persist_checkpoint(
                         checkpoint
                     )
-
-                    self._record_event(
-                        trace=trace,
-                        step=checkpoint.next_step,
-                        event_type="tool_result",
-                        details={
-                            "tool_call_id": tool_call_id,
-                            "resumed": True,
-                            **result_data,
-                        },
-                    )
-
-                except (
-                    json.JSONDecodeError,
-                    ValueError,
-                ) as exc:
-                    result_data = {
-                        "ok": False,
-                        "tool_name": tool_name,
-                        "data": None,
-                        "error": (
-                            f"工具参数解析失败：{exc}"
-                        ),
-                    }
 
                     self._record_event(
                         trace=trace,
