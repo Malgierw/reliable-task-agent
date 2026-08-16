@@ -238,6 +238,23 @@ Resume an interrupted run with its printed `run_id`:
 uv run reliable-task-agent resume <run_id>
 ```
 
+## Docker
+
+Build the runtime-only image from the locked dependencies:
+
+```bash
+docker build -t reliable-task-agent:local .
+```
+
+The container process is ephemeral; mount `/state` to retain checkpoints, traces, and the Effect Ledger across container recreation. This deterministic smoke writes those artifacts without a model or external API:
+
+```bash
+mkdir -p docker-state
+docker run --rm -v "${PWD}/docker-state:/state" --entrypoint python reliable-task-agent:local -c "from pathlib import Path; from reliable_task_agent.checkpoint import AgentCheckpoint; from reliable_task_agent.checkpoint_store import CheckpointStore; from reliable_task_agent.effects import EffectStore; from reliable_task_agent.trace import RunTrace; from reliable_task_agent.trace_store import TraceStore; root=Path('/state'); checkpoint=AgentCheckpoint(run_id='d'*32); checkpoint.mark_completed('SUCCESS'); CheckpointStore(root/'runs').save(checkpoint); trace=RunTrace(run_id=checkpoint.run_id); trace.add(step=1,event_type='final_answer',details={'status':'completed'}); TraceStore(root/'runs').save(trace); EffectStore(root/'effects.sqlite3'); print('durable-state-written')"
+```
+
+The host directory `docker-state/` will contain `runs/<run_id>/checkpoint.json`, `runs/<run_id>/trace.json`, and `effects.sqlite3`. Treat the mounted state as sensitive application data. Supply secrets only at runtime when using real model-backed commands; they are not copied into the image.
+
 ## Built-in tools
 
 | Tool | Purpose |
