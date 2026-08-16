@@ -1,0 +1,71 @@
+{
+    "schema_version":  1,
+    "source_trial_id":  "langgraph_idempotent/F2/trial-000",
+    "configuration":  "langgraph_idempotent",
+    "scenario":  "F2",
+    "repetition":  0,
+    "comparability":  "exact",
+    "run_id":  "90928400d28fe3400318473048ecd02b",
+    "tool_call_id":  "create_ticket:0",
+    "logical_action_id":  "dc29cfcbe14260c4a9280ae29497a9f46ee1d044edb865932ee2691c3c87eb70",
+    "expected_effect_id":  "971639bb2c5ee3ab2c67c5d75560d2ba304ea41b6693c8ad4e5d634500b4c4b4",
+    "expected_idempotency_key":  "rta:971639bb2c5ee3ab2c67c5d75560d2ba304ea41b6693c8ad4e5d634500b4c4b4",
+    "payload":  {
+                    "title":  "Deterministic link outage",
+                    "description":  "Investigate benchmark link outage."
+                },
+    "fault_marker":  {
+                         "stage":  "langgraph_after_business_commit",
+                         "pid":  30768,
+                         "reached_at":  "2026-08-16T11:26:07.552374+00:00"
+                     },
+    "process_outcomes":  {
+                             "initial_returncode":  15,
+                             "kill_requested":  true,
+                             "terminated_pid":  30768,
+                             "recovery_returncode":  0
+                         },
+    "initial_result":  null,
+    "recovery_result":  {
+                            "status":  "SUCCESS",
+                            "receipt":  {
+                                            "ticket_id":  1,
+                                            "logical_action_id":  "dc29cfcbe14260c4a9280ae29497a9f46ee1d044edb865932ee2691c3c87eb70",
+                                            "idempotency_key":  "rta:971639bb2c5ee3ab2c67c5d75560d2ba304ea41b6693c8ad4e5d634500b4c4b4",
+                                            "title":  "Deterministic link outage",
+                                            "description":  "Investigate benchmark link outage.",
+                                            "payload_hash":  "18e2d96f9cf1e92ab0e92e58723a99d0cbfdaaf9e7bdb220cdc5d0e745af29f1",
+                                            "created_at":  "2026-08-16T11:26:07.546680+00:00"
+                                        },
+                            "framework":  "langgraph",
+                            "worker_phase":  "recovery"
+                        },
+    "business_rows":  [
+                          {
+                              "ticket_id":  1,
+                              "logical_action_id":  "dc29cfcbe14260c4a9280ae29497a9f46ee1d044edb865932ee2691c3c87eb70",
+                              "idempotency_key":  "rta:971639bb2c5ee3ab2c67c5d75560d2ba304ea41b6693c8ad4e5d634500b4c4b4",
+                              "title":  "Deterministic link outage",
+                              "description":  "Investigate benchmark link outage.",
+                              "payload_hash":  "18e2d96f9cf1e92ab0e92e58723a99d0cbfdaaf9e7bdb220cdc5d0e745af29f1",
+                              "created_at":  "2026-08-16T11:26:07.546680+00:00"
+                          }
+                      ],
+    "observed_idempotency_keys":  [
+                                      "rta:971639bb2c5ee3ab2c67c5d75560d2ba304ea41b6693c8ad4e5d634500b4c4b4"
+                                  ],
+    "metrics":  {
+                    "business_effect_count":  1,
+                    "duplicate_side_effect":  false,
+                    "handler_invocation_count":  2,
+                    "recovery_success":  true,
+                    "final_task_success":  true,
+                    "identity_matches":  true,
+                    "comparability":  "exact",
+                    "terminal_effect_state":  null,
+                    "reconciliation_count":  0,
+                    "receipt_consistent":  true,
+                    "checkpoint_status":  null,
+                    "fail_closed_correctly":  false
+                }
+}

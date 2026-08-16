@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "source": {
+    "git_commit": "4ad16e767da1bb998e0a2e9bcc670e52c28839f8",
+    "git_branch": "feature-reliability-benchmark",
+    "dirty_before_run": false,
+    "git_status_before_run": "clean"
+  },
+  "runtime": {
+    "python_implementation": "CPython",
+    "python_version": "3.13.14",
+    "os": "Windows-10-10.0.19045-SP0",
+    "architecture": "AMD64",
+    "sqlite_runtime_version": "3.50.4"
+  },
+  "packages": {
+    "reliable-task-agent": "0.1.0",
+    "langgraph": "1.2.11",
+    "langgraph-checkpoint": "4.2.0",
+    "langgraph-checkpoint-sqlite": "3.1.1"
+  },
+  "execution": {
+    "ranked_trials_expected": 150,
+    "ranked_trials_completed": 150,
+    "descriptive_f5_trials_expected": 10,
+    "descriptive_f5_trials_completed": 10,
+    "external_model_api_used": false
+  }
+}
