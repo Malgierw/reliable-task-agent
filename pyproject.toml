@@ -1,7 +1,7 @@
 [project]
 name = "reliable-task-agent"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "A reliable agent runtime for crash recovery, deterministic verification, and side-effect-safe tool execution."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -26,6 +26,9 @@ benchmark = [
     "langgraph==1.2.11",
     "langgraph-checkpoint-sqlite==3.1.1",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"

@@ -137,6 +137,8 @@ Full tracked evidence:
 
 This project uses [uv](https://docs.astral.sh/uv/).
 
+Normal project/runtime setup does not install the optional benchmark dependencies:
+
 ```bash
 uv sync
 ```
@@ -179,8 +181,10 @@ The registry validates arguments before execution and exports tool schemas for t
 
 ## Tests
 
+The complete suite includes the cross-runtime benchmark tests, so enable the benchmark dependency group:
+
 ```bash
-uv run pytest -q
+uv run --group benchmark pytest -q
 ```
 
 Current complete suite:
