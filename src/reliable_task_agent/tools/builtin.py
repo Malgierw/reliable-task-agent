@@ -998,6 +998,7 @@ def verify_analysis_report(
 
     metrics_match = True
     metric_errors: list[str] = []
+    metric_error_details: list[dict[str, object]] = []
 
     for (
         metric_name,
@@ -1015,6 +1016,14 @@ def verify_analysis_report(
             metric_errors.append(
                 f"报告缺少指标：{metric_name}"
             )
+            metric_error_details.append(
+                {
+                    "type": "missing_metric",
+                    "field": metric_name,
+                    "expected": expected_summary,
+                    "actual": None,
+                }
+            )
             continue
 
         for key, expected_value in (
@@ -1028,6 +1037,14 @@ def verify_analysis_report(
                 metrics_match = False
                 metric_errors.append(
                     f"{metric_name} 缺少 {key}"
+                )
+                metric_error_details.append(
+                    {
+                        "type": "missing_metric_field",
+                        "field": f"{metric_name}.{key}",
+                        "expected": expected_value,
+                        "actual": None,
+                    }
                 )
                 continue
 
@@ -1045,6 +1062,14 @@ def verify_analysis_report(
                         f"报告中为 {reported_value}"
                     )
                 )
+                metric_error_details.append(
+                    {
+                        "type": "metric_value_mismatch",
+                        "field": f"{metric_name}.{key}",
+                        "expected": expected_value,
+                        "actual": reported_value,
+                    }
+                )
 
     verification_passed = (
         row_count_matches
@@ -1054,6 +1079,7 @@ def verify_analysis_report(
     )
 
     errors: list[str] = []
+    error_details: list[dict[str, object]] = []
 
     if not row_count_matches:
         errors.append(
@@ -1062,6 +1088,14 @@ def verify_analysis_report(
                 f"实际为 {len(rows)}"
             )
         )
+        error_details.append(
+            {
+                "type": "row_count_mismatch",
+                "field": "row_count",
+                "expected": required_runs,
+                "actual": len(rows),
+            }
+        )
 
     if not status_matches:
         errors.append(
@@ -1069,6 +1103,14 @@ def verify_analysis_report(
                 f"总体状态应为 {expected_status}，"
                 f"报告中为 {reported_status}"
             )
+        )
+        error_details.append(
+            {
+                "type": "status_mismatch",
+                "field": "overall_status",
+                "expected": expected_status,
+                "actual": reported_status,
+            }
         )
 
     if not failed_runs_match:
@@ -1079,8 +1121,17 @@ def verify_analysis_report(
                 f"报告中为 {reported_failed_runs}"
             )
         )
+        error_details.append(
+            {
+                "type": "failed_runs_mismatch",
+                "field": "failed_runs",
+                "expected": failed_runs,
+                "actual": reported_failed_runs,
+            }
+        )
 
     errors.extend(metric_errors)
+    error_details.extend(metric_error_details)
 
     return {
         "verification_passed": (
@@ -1107,6 +1158,7 @@ def verify_analysis_report(
             ),
         },
         "errors": errors,
+        "error_details": error_details,
     }
 
 def build_default_registry(

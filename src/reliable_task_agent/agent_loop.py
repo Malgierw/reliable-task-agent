@@ -73,6 +73,7 @@ class AgentLoop:
         client: OpenAI | None = None,
         model: str | None = None,
         max_steps: int = 5,
+        max_repair_attempts: int = 2,
         max_model_retries: int = 2,
         retry_delay_seconds: float = 1.0,
         sleep_fn: Callable[[float], None] = time.sleep,
@@ -96,6 +97,11 @@ class AgentLoop:
                 "max_model_retries 必须大于等于 0。"
             )
 
+        if max_repair_attempts < 0:
+            raise ValueError(
+                "max_repair_attempts 必须大于等于 0。"
+            )
+
         if retry_delay_seconds < 0:
             raise ValueError(
                 "retry_delay_seconds 必须大于等于 0。"
@@ -105,6 +111,7 @@ class AgentLoop:
         self.client = client
         self.model = model
         self.max_steps = max_steps
+        self.max_repair_attempts = max_repair_attempts
         self.max_model_retries = max_model_retries
         self.retry_delay_seconds = retry_delay_seconds
         self.sleep_fn = sleep_fn
@@ -175,6 +182,132 @@ class AgentLoop:
         )
 
         self._persist_trace(trace)
+
+    def _handle_verification_result(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        result_data: dict[str, Any],
+        messages: list[dict[str, Any]],
+        checkpoint: AgentCheckpoint,
+        trace: RunTrace,
+        step: int,
+    ) -> None:
+        """在确定性验证失败后请求一个有上限的修复周期。
+
+        repair_count 统计已经向模型请求的修复周期。达到上限后，
+        下一次验证失败会终止运行，而不会再请求新的修复周期。
+        """
+
+        if (
+            tool_call_id
+            in checkpoint.handled_verification_tool_call_ids
+        ):
+            return
+
+        data = result_data.get("data")
+
+        is_verification_failure = (
+            tool_name == "verify_analysis_report"
+            and result_data.get("ok") is True
+            and isinstance(data, dict)
+            and data.get("verification_passed") is False
+        )
+
+        if not is_verification_failure:
+            return
+
+        errors = data.get("errors")
+        verifier_errors = (
+            errors
+            if isinstance(errors, list)
+            else []
+        )
+
+        checks = data.get("checks")
+        verifier_checks = (
+            checks
+            if isinstance(checks, dict)
+            else {}
+        )
+
+        error_details = data.get("error_details")
+        verifier_error_details = (
+            error_details
+            if isinstance(error_details, list)
+            else []
+        )
+
+        if checkpoint.repair_count >= self.max_repair_attempts:
+            error_message = (
+                "确定性验证持续失败，已用尽 "
+                f"{self.max_repair_attempts} 次修复机会。"
+            )
+
+            checkpoint.mark_failed(error_message)
+            self._persist_checkpoint(checkpoint)
+
+            self._record_event(
+                trace=trace,
+                step=step,
+                event_type="error",
+                details={
+                    "stage": "verification_repair",
+                    "repair_count": checkpoint.repair_count,
+                    "max_repair_attempts": self.max_repair_attempts,
+                    "verifier_errors": verifier_errors,
+                    "verifier_checks": verifier_checks,
+                    "message": error_message,
+                },
+            )
+
+            raise RuntimeError(error_message)
+
+        checkpoint.repair_count += 1
+        repair_attempt = checkpoint.repair_count
+        checkpoint.handled_verification_tool_call_ids.add(
+            tool_call_id
+        )
+
+        feedback = {
+            "errors": verifier_errors,
+            "error_details": verifier_error_details,
+            "checks": verifier_checks,
+        }
+
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Runtime verifier guidance: deterministic verification "
+                    "failed. Treat the verifier errors as ground truth, "
+                    "repair the failed artifact/result, then call "
+                    "verify_analysis_report again. Do not claim SUCCESS "
+                    "until verification_passed=true. Verifier feedback: "
+                    + json.dumps(feedback, ensure_ascii=False)
+                ),
+            }
+        )
+
+        self._sync_checkpoint_messages(
+            checkpoint=checkpoint,
+            messages=messages,
+            next_step=step,
+        )
+
+        self._record_event(
+            trace=trace,
+            step=step,
+            event_type="repair_requested",
+            details={
+                "repair_attempt": repair_attempt,
+                "max_repair_attempts": self.max_repair_attempts,
+                "verifier_errors": verifier_errors,
+                "verifier_error_details": verifier_error_details,
+                "verifier_checks": verifier_checks,
+            },
+        )
     
     def _request_model(
         self,
@@ -385,6 +518,10 @@ class AgentLoop:
                 return assistant_message.content
 
             # 模型一轮中可能请求调用一个或多个工具
+            verification_results: list[
+                tuple[str, str, dict[str, Any]]
+            ] = []
+
             for tool_call in assistant_message.tool_calls:
                 tool_name = tool_call.function.name
                 raw_arguments = tool_call.function.arguments
@@ -459,6 +596,7 @@ class AgentLoop:
                         "data": None,
                         "error": f"工具参数解析失败：{exc}",
                     }
+                    result_data = failure_data
 
                     self._record_event(
                         trace=trace,
@@ -499,6 +637,35 @@ class AgentLoop:
                     checkpoint=checkpoint,
                     messages=messages,
                     next_step=step,
+                )
+
+                self._maybe_inject_fault(
+                    "after_tool_message_checkpoint"
+                )
+
+                verification_results.append(
+                    (
+                        tool_call.id,
+                        tool_name,
+                        result_data,
+                    )
+                )
+
+            # 必须先把同一 assistant 消息对应的所有 tool message
+            # 放入上下文，再追加运行时 guidance，保持工具消息顺序合法。
+            for (
+                tool_call_id,
+                tool_name,
+                result_data,
+            ) in verification_results:
+                self._handle_verification_result(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    result_data=result_data,
+                    messages=messages,
+                    checkpoint=checkpoint,
+                    trace=trace,
+                    step=step,
                 )
             
             checkpoint.advance_to(step + 1)
@@ -575,12 +742,31 @@ class AgentLoop:
         }
 
         changed = False
+        verification_results: list[
+            tuple[str, str, dict[str, Any]]
+        ] = []
 
         for tool_call in tool_calls:
             tool_call_id = tool_call["id"]
 
-            # 已经有 tool message，就不再处理。
+            # 已经有 tool message 时不重复执行工具，但仍需检查
+            # 该 Verifier 结果是否完成了幂等 repair bookkeeping。
             if tool_call_id in responded_tool_call_ids:
+                saved_call = (
+                    checkpoint.completed_tool_calls.get(
+                        tool_call_id
+                    )
+                )
+
+                if saved_call is not None:
+                    verification_results.append(
+                        (
+                            tool_call_id,
+                            saved_call.tool_name,
+                            saved_call.result,
+                        )
+                    )
+
                 continue
 
             function_data = tool_call["function"]
@@ -703,14 +889,19 @@ class AgentLoop:
                 }
             )
 
+            verification_results.append(
+                (
+                    tool_call_id,
+                    tool_name,
+                    result_data,
+                )
+            )
+
             responded_tool_call_ids.add(
                 tool_call_id
             )
 
             changed = True
-
-        if not changed:
-            return
 
         # 所有工具都有结果以后，才允许进入下一轮模型调用。
         expected_ids = {
@@ -718,7 +909,7 @@ class AgentLoop:
             for tool_call in tool_calls
         }
 
-        if expected_ids.issubset(
+        if changed and expected_ids.issubset(
             responded_tool_call_ids
         ):
             checkpoint.messages = deepcopy(
@@ -731,6 +922,21 @@ class AgentLoop:
 
             self._persist_checkpoint(
                 checkpoint
+            )
+
+        for (
+            tool_call_id,
+            tool_name,
+            result_data,
+        ) in verification_results:
+            self._handle_verification_result(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                result_data=result_data,
+                messages=messages,
+                checkpoint=checkpoint,
+                trace=trace,
+                step=checkpoint.next_step,
             )
 
     def resume(self, run_id: str) -> str:
