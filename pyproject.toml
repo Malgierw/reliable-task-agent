@@ -5,6 +5,7 @@ description = "A reliable agent runtime for crash recovery, deterministic verifi
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "mcp>=2.0.0",
     "openai>=2.52.0",
     "python-dotenv>=1.2.2",
     "rich>=15.0.0",
